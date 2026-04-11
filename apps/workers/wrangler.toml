@@ -1,0 +1,64 @@
+name = "platform-api"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Routes (top-level, NOT under observability)
+routes = [
+  { pattern = "api.quickbizkit.ai/*", zone_name = "quickbizkit.ai" }
+]
+
+# ============================================================
+# CONTAINERS CONFIGURATION
+# ============================================================
+[[containers]]
+class_name = "VideoProcessor"
+image = "./containers/video-processor/Dockerfile"
+max_instances = 5
+instance_type = "standard-1"
+
+# ============================================================
+# DURABLE OBJECTS BINDINGS
+# ============================================================
+[[durable_objects.bindings]]
+name = "VIDEO_PROCESSOR"
+class_name = "VideoProcessor"
+
+# ============================================================
+# MIGRATIONS
+# ============================================================
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["VideoProcessor"]
+
+# ============================================================
+# EXISTING BINDINGS
+# ============================================================
+[[kv_namespaces]]
+binding = "PLATFORM_KV"
+id = "20303aa213d14ee39a27ed0c1c20e0fc"
+
+[[kv_namespaces]]
+binding = "RATE_LIMITS"
+id = "97e173aea9224bffb67f3c1f2ae343d2"
+
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "platform-storage"
+
+[[queues.producers]]
+binding = "VIDEO_QUEUE"
+queue = "video-processing-queue"
+
+[[queues.consumers]]
+queue = "video-processing-queue"
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "platform-rag-index"
+
+[vars]
+ENVIRONMENT = "development"
+
+[observability]
+enabled = true

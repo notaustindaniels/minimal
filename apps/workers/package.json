@@ -1,0 +1,19 @@
+{
+  "name": "platform-api",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "containers:list": "wrangler containers list",
+    "containers:images": "wrangler containers images list"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241127.0",
+    "typescript": "^5.0.0",
+    "wrangler": "^3.91.0"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "0.0.31"
+  }
+}
