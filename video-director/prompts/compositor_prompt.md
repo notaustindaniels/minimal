@@ -1,41 +1,67 @@
 # Phase C — Compositor
 
-You are the **compositor**. Every scene component has been written. Your
-job is to assemble them into a single Remotion `Composition`, verify the
-alignment invariant, and render the final MP4.
+You are the **compositor**. Every shot component has been written. Your
+job is to assemble them into a single Remotion `Composition`, mount the
+caption overlay, verify the alignment invariant, and render the final
+MP4.
 
 ## Your inputs
 
-- `timing.json` — `fps`, `total_frames`, `scenes[]` with `start_frame`/`end_frame`.
-- `src/scenes/Scene*.tsx` — one file per scene, each exporting a React component.
-- `src/anchors.ts` — fully populated by Phase B scene agents.
+- `timing.json` — `fps`, `total_frames`, `shots[]` with `start_frame`/
+  `end_frame`, `anchors[]`, `captions[]`.
+- `src/shots/Shot*.tsx` — one file per shot.
+- `src/anchors.ts` — fully populated by Phase B.
+- `src/Captions.tsx` — pre-scaffolded by the harness driver. **Do not
+  edit it.** It already reads `timing.json.captions` and renders the
+  active caption every frame.
 - `public/audio.mp3` — the narration track.
-- `alignment.test.ts` — already written by the harness driver; do not edit it.
+- `alignment.test.ts` — pre-scaffolded by the harness driver.
 
 ## Your outputs
 
-1. `src/Root.tsx` — the Composition registry.
-2. An updated `scene_status.json` with every scene transitioning
-   `aligned → rendered` after a successful render.
-3. `out/video.mp4` — produced by `npx remotion render`.
+1. `src/Root.tsx` — the Composition registry that mounts every shot in
+   order, plus the audio track and the captions overlay.
+2. `out/video.mp4` — produced by `npx remotion render`.
 
 ## `src/Root.tsx` contract
 
 ```tsx
-import { Composition, Audio, Sequence, staticFile } from "remotion";
+import {
+  Composition,
+  AbsoluteFill,
+  Audio,
+  Sequence,
+  staticFile,
+} from "remotion";
 import timing from "../timing.json";
-import { Scene1 } from "./scenes/Scene1";
-import { Scene2 } from "./scenes/Scene2";
-// ...import every scene
+import { Captions } from "./Captions";
+import { Shot01 } from "./shots/Shot01";
+import { Shot02 } from "./shots/Shot02";
+// ...one import per shot
+
+const SHOT_COMPONENTS: Record<string, React.FC> = {
+  shot01: Shot01,
+  shot02: Shot02,
+  // ...
+};
 
 const Main: React.FC = () => (
-  <>
+  <AbsoluteFill style={{ backgroundColor: "#0F1419" }}>
     <Audio src={staticFile("audio.mp3")} />
-    <Sequence from={timing.scenes[0].start_frame} durationInFrames={timing.scenes[0].end_frame - timing.scenes[0].start_frame}>
-      <Scene1 />
-    </Sequence>
-    {/* ...one Sequence per scene */}
-  </>
+    {timing.shots.map((shot) => {
+      const Component = SHOT_COMPONENTS[shot.id];
+      return (
+        <Sequence
+          key={shot.id}
+          from={shot.start_frame}
+          durationInFrames={shot.end_frame - shot.start_frame}
+        >
+          <Component />
+        </Sequence>
+      );
+    })}
+    <Captions />
+  </AbsoluteFill>
 );
 
 export const RemotionRoot: React.FC = () => (
@@ -50,33 +76,38 @@ export const RemotionRoot: React.FC = () => (
 );
 ```
 
-Rules:
-- Sequence `from` must equal `timing.scenes[i].start_frame`. Never a literal number.
-- `durationInFrames` must equal `timing.total_frames`.
+Hard rules:
+
+- `Sequence from` must equal `timing.shots[i].start_frame`. Never a
+  literal number.
+- `durationInFrames` on the `Composition` must equal `timing.total_frames`.
 - `fps` must equal `timing.fps`.
-- One `<Audio>` mount at the top level — do not mount audio inside scenes.
+- One `<Audio>` mounted at the top of `Main`.
+- `<Captions />` mounted **last** (so it overlays everything else).
+- Background color on the AbsoluteFill so any frame between shots is
+  not pure black.
 
 ## Workflow
 
-1. Read `timing.json` to know how many scenes exist and their frame ranges.
-2. Glob `src/scenes/Scene*.tsx` to confirm every scene component is present.
-   If one is missing, stop and report it — do not fabricate a placeholder.
+1. Read `timing.json` to get the shot list, fps, total_frames.
+2. Glob `src/shots/Shot*.tsx` to confirm every shot in `timing.shots`
+   has a file. If any are missing, stop and report which ones.
 3. Write `src/Root.tsx` following the contract above.
-4. Run `npx vitest run alignment.test.ts`. If it fails, read the output
-   and identify which anchor is off. **Do not edit scene components to
-   make the test pass** — instead, report the failing anchor id and stop.
-   Scene agents are responsible for their own alignment; the compositor
-   only verifies.
-5. If the alignment test passes, run `npx remotion render main out/video.mp4`.
-6. If the render succeeds, update `scene_status.json` — set every scene's
-   status to `"rendered"`.
+4. Run `npx vitest run alignment.test.ts`. If it fails, read the output,
+   identify which anchor is off, and **stop** — report the failing
+   anchor id. Do not edit shot components to make the test pass; that
+   is the shot agent's responsibility on the next iteration.
+5. If the alignment test passes, run `npx remotion render`.
+6. If the render succeeds, you're done. Print the output path.
 7. Stop.
 
 ## What NOT to do
 
-- Do not modify scene components. If alignment fails, the problem is in
-  the scene that owns the failing anchor, and a fresh Phase B agent will
-  fix it on the next iteration.
+- Do not modify shot components.
+- Do not modify `Captions.tsx`. It is generated; the captions layer is
+  not negotiable.
 - Do not touch `timing.json`, `script.json`, `public/audio.mp3`, or
   `alignment.test.ts`.
-- Do not declare new anchors. The anchor set is frozen after Phase A.
+- Do not declare new anchors or shots. The set is frozen after Phase A.
+- Do not render text in `Root.tsx` other than mounting the components
+  and the captions overlay. No header, no title card, nothing else.

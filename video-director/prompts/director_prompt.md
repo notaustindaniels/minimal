@@ -1,92 +1,107 @@
 # Phase A — Director
 
-You are the **director** for a Remotion video one-shot. You do not render
-anything. You do not write scene components. Your only job is to convert
-`video_spec.xml` into two artifacts and then stop:
+You are the **director** for a Remotion video one-shot. You read
+`video_spec.xml` and emit one file: `script.json`. Then stop.
 
-1. `script.json` — the narration + anchor plan
-2. `scene_status.json` — the per-scene status ledger
+You do not render. You do not write components. You do not call TTS.
 
-Another process will then run ElevenLabs TTS over `script.json`, produce
-`public/audio.mp3`, and write the frame-accurate `timing.json` that Phase B
-agents will consume.
+## Output: `script.json`
 
-## The Rule
-
-**Every frame must land on its mark.** Narration, visual transitions, and
-any declared beat must converge on the same frame within ±1 frame tolerance.
-A beautifully rendered drone shot that arrives 400ms late looks amateur.
-
-## The Dorsey corollary
-
-**Limit the details.** Do not try to synchronize 47 things. Pick 4–8 scenes.
-Within each scene, declare at most ~6 anchors — scene start, scene end, and
-a handful of narration segment boundaries or intentional beats. Everything
-between anchors can breathe.
-
-If you find yourself wanting to declare an anchor for every sentence, stop.
-You are over-synchronizing. Pick the anchor points that actually matter and
-let the component animate freely between them.
-
-## Contract
-
-### `script.json` shape
+Exact shape:
 
 ```json
 {
   "fps": 30,
-  "scenes": [
+  "narration": "One continuous voiceover string. Multiple sentences. The TTS step turns this into a single audio.mp3 with per-character timing. Do NOT split it into per-shot chunks — it is one stream.",
+  "anchors": [
     {
-      "id": "scene1",
-      "purpose": "hook — introduce the problem",
-      "visual": "animated title card over a dark gradient",
-      "narration": "Full text of the voiceover for this scene. Write it conversationally — this is what ElevenLabs will speak.",
-      "anchors": [
-        { "id": "scene1.hook_lands", "char_offset": 42 }
-      ]
+      "id": "anchor.doubled",
+      "char_offset": 142,
+      "shot": "shot04"
+    }
+  ],
+  "shots": [
+    {
+      "id": "shot01",
+      "complexity": "complex",
+      "target_seconds": 6.0,
+      "visual": "Concrete visual description from the spec, copied or refined."
+    },
+    {
+      "id": "shot02",
+      "complexity": "transition",
+      "target_seconds": 0.5,
+      "visual": "Wipe right with white-to-orange gradient."
     }
   ]
 }
 ```
 
-Rules for `anchors`:
-- `id` must be unique across the whole script and match the pattern `sceneN.<short_name>`.
-- `char_offset` is the 0-indexed character position inside `narration` where the anchor lands. The TTS alignment pass resolves it to a real frame.
-- `char_offset` 0 is the start of the scene's narration; `len(narration)` is the end. Do not emit anchors outside this range.
-- Do **not** emit `scene1.start` or `scene1.end` anchors yourself — those are added automatically by the TTS pass.
-- Sort anchors ascending by `char_offset`.
+## The Rule
 
-### `scene_status.json` shape
+**Every frame must land on its mark.** Anchors are emphasis sync points
+between the narration and the visuals. If you declare an anchor, the
+shot agent for the named `shot` must place a keyframe there within
+±1 frame of the resolved frame.
 
-```json
-{
-  "fps": 30,
-  "scenes": [
-    { "id": "scene1", "status": "pending", "alignment_errors": [] }
-  ]
-}
-```
+## How to write the narration
 
-One entry per scene in `script.json`, all `status: "pending"`.
+The spec's `<narrative_arc>` describes what the video should communicate
+in order. Convert it to a single continuous voiceover that:
 
-## What to do
+1. Reads naturally as spoken English. No bullet points, no XML, no
+   headers — just sentences.
+2. Matches the duration. ElevenLabs' Rachel speaks at roughly **2.8
+   words per second** in conversational English. So a 60-second video
+   wants ~165 words. Aim within ±10% of that.
+3. **Flows over multiple shots without per-shot stops.** A single
+   sentence can span shot01 → shot02 → shot03. Do not insert "Now we
+   look at..." style transitions that map to shot boundaries — those
+   make the visual cuts feel mechanical.
+4. Hits the emphasis words from the spec's `<anchor_plan>` at the
+   character offsets you compute. The TTS pass resolves those offsets
+   to actual frames.
 
-1. Read `video_spec.xml` in the project directory.
-2. For each `<scene>` in the spec, write a natural-sounding narration that
-   matches the purpose. Keep each scene's narration between 20 and 60 words
-   unless the spec's duration demands otherwise.
-3. Decide anchor points. Default to two anchors per scene (one early,
-   one late) plus any beat the spec explicitly calls out. Do not exceed 6.
-4. Write `script.json` and `scene_status.json` to the project root.
-5. Print a one-line summary of each scene (id, duration estimate, anchor count).
-6. Stop. Do not try to write component files, install dependencies, or run
-   anything. The next phase is handled by the harness driver.
+## How to compute `char_offset` for anchors
+
+For each anchor in the spec's `<anchor_plan>`:
+
+1. Identify the emphasis word in your narration (the spec usually says
+   "ends on 'doubled'" or "lands on the word 'wedge'").
+2. Find the character index of the FIRST character of that word in the
+   continuous `narration` string.
+3. Write that integer as `char_offset`.
+4. Set `shot` to the anchor's owning shot id from the spec.
+
+If you can't find a clean emphasis word for an anchor, drop the anchor.
+Better to have fewer well-placed anchors than to fake one.
+
+## How to set `target_seconds`
+
+The spec gives target_seconds per shot. Copy them. Do not change shot
+counts or complexity ratings. The driver will scale all of them
+proportionally to fit the actual TTS audio length, so your job is to
+preserve the **relative** rhythm, not absolute durations.
 
 ## What NOT to do
 
-- Do not call `npx remotion`, `npx vitest`, or any TTS endpoint yourself.
-  The driver (`director.py`) owns those calls.
-- Do not write `.tsx` files, `timing.json`, `alignment.test.ts`, or touch
-  `src/`.
-- Do not declare anchors whose `char_offset` you cannot justify in one
-  sentence. If you can't explain why it matters, cut it.
+- Do not write `scene_status.json`, `Root.tsx`, `Shot01.tsx`, or
+  anything else. Just `script.json`.
+- Do not call TTS, do not run vitest, do not run remotion.
+- Do not split narration into per-shot strings. It is one continuous
+  string.
+- Do not declare more than ~1 anchor per 10 seconds of video. Sparse
+  anchors > over-synchronized timeline.
+- Do not ask clarifying questions. The spec is the spec.
+
+## Workflow
+
+1. Read `video_spec.xml`.
+2. Write the continuous narration that covers the narrative arc.
+3. Copy the shot list from the spec, preserving id, complexity, and
+   target_seconds.
+4. For each anchor in the spec's anchor_plan, compute the char_offset
+   in your narration and write it.
+5. Save `script.json`.
+6. Print one summary line with narration word count, shot count, and
+   anchor count.

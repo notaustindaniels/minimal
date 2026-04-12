@@ -1,15 +1,13 @@
 """
-Tier 1 — offline plumbing test.
+Tier 1 — offline plumbing test (shot-list model).
 
-Exercises everything in director.py that does NOT require Claude or
-ElevenLabs:
+Exercises everything in director.py / tts.py / validator.py that does
+NOT require Claude or ElevenLabs:
   - scaffold_project()
+  - tts._scale_shots() and tts._derive_captions() with stub alignment
   - generate_alignment_test()
-  - stitch_anchors()
-  - run_alignment_test()  (only if `npx vitest` is reachable)
-
-Uses a hand-crafted spec, script, and timing file. Writes a fake scene
-component + anchors.json so the alignment test can pass for real.
+  - stitch_anchors() against fake Shot*.anchors.json
+  - run_alignment_test() against a real (stub-data) project
 
 Run with:
     source myvenv/bin/activate && python video-director/tier1_offline_test.py
@@ -26,14 +24,17 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PROJECT = Path("/tmp/video-director-tier1")
+FPS = 30
 
-# Load director.py via importlib so we get the same module-loading helpers.
 sys.path.insert(0, str(HERE.parent / "autonomous-coding"))
-spec = importlib.util.spec_from_file_location("director", HERE / "director.py")
-# director.py imports claude_code_sdk at top level — that's fine, it's installed.
-director = importlib.util.module_from_spec(spec)
-sys.modules["director"] = director
-spec.loader.exec_module(director)
+
+
+def _load(name: str):
+    spec = importlib.util.spec_from_file_location(f"vd_{name}", HERE / f"{name}.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[f"vd_{name}"] = m
+    spec.loader.exec_module(m)
+    return m
 
 
 def main() -> None:
@@ -44,52 +45,110 @@ def main() -> None:
     PROJECT.parent.mkdir(parents=True, exist_ok=True)
     fake_spec.write_text("<video_specification>tier1 stub</video_specification>")
 
+    # Director.py is loaded after the others so its claude-sdk import works.
+    director = importlib.util.spec_from_file_location("director", HERE / "director.py")
+    director_mod = importlib.util.module_from_spec(director)
+    sys.modules["director"] = director_mod
+    director.loader.exec_module(director_mod)
+
     print("[tier1] scaffold_project()")
-    director.scaffold_project(PROJECT, fake_spec)
+    director_mod.scaffold_project(PROJECT, fake_spec)
+
+    # Confirm new scaffold artifacts are present.
+    assert (PROJECT / "src" / "Captions.tsx").exists(), "Captions.tsx missing"
+    assert (PROJECT / "src" / "shots").exists(), "src/shots missing"
 
     # Hand-craft a timing.json that the validator + stitcher can chew on.
+    # 3 shots: complex (60f) + transition (15f) + simple (45f) = 120f = 4.0s @ 30fps
     timing = {
-        "fps": 30,
-        "audio_path": "public/audio.wav",
-        "total_frames": 90,
+        "fps": FPS,
+        "audio_path": "public/audio.mp3",
+        "total_frames": 120,
         "anchors": [
-            {"id": "scene1.start", "frame": 0, "seconds": 0.0},
-            {"id": "scene1.beat", "frame": 30, "seconds": 1.0},
-            {"id": "scene1.end", "frame": 90, "seconds": 3.0},
+            {"id": "anchor.beat", "frame": 30, "shot": "shot01"},
+            {"id": "anchor.land", "frame": 90, "shot": "shot03"},
         ],
-        "scenes": [{"id": "scene1", "start_frame": 0, "end_frame": 90}],
+        "shots": [
+            {"id": "shot01", "complexity": "complex",    "start_frame": 0,  "end_frame": 60},
+            {"id": "shot02", "complexity": "transition", "start_frame": 60, "end_frame": 75},
+            {"id": "shot03", "complexity": "simple",     "start_frame": 75, "end_frame": 120},
+        ],
+        "captions": [
+            {"text": "stub caption one",   "start_frame": 0,  "end_frame": 60},
+            {"text": "stub caption two",   "start_frame": 60, "end_frame": 120},
+        ],
     }
     (PROJECT / "timing.json").write_text(json.dumps(timing, indent=2))
-    print("[tier1] wrote stub timing.json (3 anchors, 1 scene)")
+    print("[tier1] wrote stub timing.json (3 shots, 2 anchors, 2 captions)")
 
     print("[tier1] generate_alignment_test()")
-    director.generate_alignment_test(PROJECT, PROJECT / "timing.json")
+    validator_mod = _load("validator")
+    validator_mod.generate_alignment_test(PROJECT, PROJECT / "timing.json")
     assert (PROJECT / "alignment.test.ts").exists()
 
-    # Pretend a scene agent ran: write Scene1.anchors.json with the same frames.
-    (PROJECT / "src" / "scenes" / "Scene1.anchors.json").write_text(
-        json.dumps({"scene1.start": 0, "scene1.beat": 30, "scene1.end": 90}, indent=2)
-    )
+    # Pretend each shot agent ran: write the corresponding files.
+    shots_dir = PROJECT / "src" / "shots"
+    for sid in ("shot01", "shot02", "shot03"):
+        suffix = director_mod._shot_suffix(sid)
+        (shots_dir / f"Shot{suffix}.tsx").write_text(
+            f"export const Shot{suffix}: React.FC = () => null;\n"
+        )
+    # Anchors: shot01 owns anchor.beat=30, shot03 owns anchor.land=90
+    (shots_dir / "Shot01.anchors.json").write_text(json.dumps({"anchor.beat": 30}))
+    (shots_dir / "Shot02.anchors.json").write_text(json.dumps({}))
+    (shots_dir / "Shot03.anchors.json").write_text(json.dumps({"anchor.land": 90}))
 
     print("[tier1] stitch_anchors()")
-    n = director.stitch_anchors(PROJECT)
+    n = director_mod.stitch_anchors(PROJECT)
     print(f"[tier1] stitched {n} anchors")
-    anchors_ts = (PROJECT / "src" / "anchors.ts").read_text()
-    assert "scene1.beat" in anchors_ts
-    assert "30" in anchors_ts
+    assert n == 2
 
-    # Try to run the alignment test for real if `npx vitest` is reachable.
-    print("[tier1] checking npx availability")
-    npx = shutil.which("npx")
-    if not npx:
-        print("[tier1] npx not found — skipping vitest run")
-        print("[tier1] PASS (without vitest)")
-        return
+    # Test the TTS helpers offline (no network).
+    tts_mod = _load("tts")
+    print("[tier1] tts._scale_shots() — 3 shots, target=10s, actual=12s")
+    scaled = tts_mod._scale_shots(
+        [
+            {"id": "shot01", "complexity": "complex",    "target_seconds": 6.0},
+            {"id": "shot02", "complexity": "transition", "target_seconds": 0.5},
+            {"id": "shot03", "complexity": "simple",     "target_seconds": 2.0},
+        ],
+        total_seconds=12.0,
+        fps=FPS,
+    )
+    last_end = scaled[-1]["end_frame"]
+    expected_last_end = round(12.0 * FPS)
+    assert last_end == expected_last_end, f"last shot end {last_end} != {expected_last_end}"
+    print(f"[tier1]   scaled shots: {[(s['id'], s['start_frame'], s['end_frame']) for s in scaled]}")
+    assert scaled[0]["start_frame"] == 0
 
-    # Need pnpm install before vitest can resolve. Skip vitest run by default;
-    # report that we got far enough that the only missing piece is `pnpm install`.
-    print(f"[tier1] npx found at {npx}; vitest run requires `pnpm install` first")
-    print("[tier1] not running vitest (would need ~30s install). All Python plumbing OK.")
+    print("[tier1] tts._derive_captions() — fake alignment")
+    fake_alignment = {
+        "characters": list("hello world this is a test caption layer ok"),
+        "character_start_times_seconds": [i * 0.05 for i in range(43)],
+        "character_end_times_seconds":   [i * 0.05 + 0.05 for i in range(43)],
+    }
+    captions = tts_mod._derive_captions(
+        "hello world this is a test caption layer ok", fake_alignment, FPS
+    )
+    print(f"[tier1]   derived {len(captions)} captions")
+    assert len(captions) >= 1
+    for c in captions:
+        assert c["end_frame"] >= c["start_frame"]
+
+    # Try to run the real vitest alignment test (requires pnpm install in
+    # the project, which scaffold_project did).
+    print("[tier1] running real vitest alignment.test.ts")
+    proc = subprocess.run(
+        ["npx", "vitest", "run", "alignment.test.ts", "--reporter=verbose"],
+        cwd=PROJECT,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        print("[tier1] vitest FAILED:")
+        print(proc.stdout[-1500:])
+        sys.exit(1)
+    print("[tier1] vitest PASSED")
     print("[tier1] PASS")
 
 

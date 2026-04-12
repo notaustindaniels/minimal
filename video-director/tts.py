@@ -1,27 +1,33 @@
 """
-ElevenLabs TTS + alignment → timing.json.
+ElevenLabs TTS + alignment → audio.mp3, timing.json (continuous-narration model).
 
-Phase A gate: director.py calls synthesize_script() with a parsed script.json
-(list of scenes, each with narration text and anchor ids). This module:
+This module is responsible for converting Phase A's `script.json` (one
+continuous narration string + anchor list + shot list) into:
 
-  1. Calls ElevenLabs text-to-speech-with-timestamps for each scene
-  2. Concatenates audio to a single audio.wav
-  3. Uses the per-character alignment response to compute absolute frames
-     for every declared anchor at the project fps
-  4. Writes timing.json — the source of truth Phase B scene agents read
+  - public/audio.mp3   — the spoken voiceover, one continuous track
+  - timing.json        — frame-accurate metadata: anchors resolved to
+                          frames, shot frame ranges (scaled to fit the
+                          actual audio length), and a caption layer
+                          derived from per-character alignment data.
 
-timing.json schema:
+Schema of timing.json:
 {
   "fps": 30,
-  "audio_path": "public/audio.wav",
-  "total_frames": 1800,
+  "audio_path": "public/audio.mp3",
+  "total_frames": 2325,
   "anchors": [
-    {"id": "scene1.start",    "frame": 0,   "seconds": 0.0},
-    {"id": "scene1.narration.0", "frame": 12, "seconds": 0.4},
+    {"id": "hook",      "frame": 42,   "shot": "shot02"},
+    {"id": "punchline", "frame": 1140, "shot": "shot07"}
+  ],
+  "shots": [
+    {"id": "shot01", "complexity": "complex",    "start_frame": 0,   "end_frame": 180},
+    {"id": "shot02", "complexity": "transition", "start_frame": 180, "end_frame": 195},
     ...
   ],
-  "scenes": [
-    {"id": "scene1", "start_frame": 0, "end_frame": 450}
+  "captions": [
+    {"text": "Airline economics are dominated by",  "start_frame": 0,  "end_frame": 51},
+    {"text": "fixed costs that don't go away.",      "start_frame": 51, "end_frame": 96},
+    ...
   ]
 }
 """
@@ -31,7 +37,7 @@ from __future__ import annotations
 import base64
 import json
 import os
-from dataclasses import dataclass
+import re
 from pathlib import Path
 from typing import Any
 
@@ -42,21 +48,13 @@ import urllib.error
 ELEVENLABS_API = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps"
 DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # Rachel
 DEFAULT_MODEL = "eleven_turbo_v2_5"
-# The with-timestamps endpoint returns MP3 in audio_base64 by default.
-# We keep that — Remotion handles mp3 natively via staticFile().
 AUDIO_FILENAME = "audio.mp3"
 
-
-@dataclass
-class SceneNarration:
-    """One scene's narration payload as consumed by the director."""
-
-    scene_id: str
-    text: str
-    # Anchor id prefixes that must resolve to frames within this scene.
-    # The director declares anchor positions as character offsets (0 = start
-    # of this scene's narration, len(text) = end). Must be sorted ascending.
-    anchor_char_offsets: list[tuple[str, int]]
+# Caption grouping target: emit a new caption every N words OR at any
+# punctuation that ends a clause. Six words is a comfortable read for
+# captions overlaid on motion graphics.
+CAPTION_TARGET_WORDS = 6
+CAPTION_BREAK_PUNCT = set(".!?,;:—")
 
 
 class TTSError(RuntimeError):
@@ -106,7 +104,7 @@ def _call_elevenlabs(text: str, api_key: str, voice_id: str) -> dict[str, Any]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=180) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
@@ -116,7 +114,6 @@ def _call_elevenlabs(text: str, api_key: str, voice_id: str) -> dict[str, Any]:
 
 
 def _alignment_duration(alignment: dict[str, Any]) -> float:
-    """Return the audio duration in seconds, derived from alignment data."""
     ends = alignment.get("character_end_times_seconds") or []
     if ends:
         return float(ends[-1])
@@ -128,174 +125,240 @@ def _char_offset_to_seconds(
     char_offset: int, alignment: dict[str, Any], fallback_duration: float
 ) -> float:
     """
-    Resolve an input-text character offset to an absolute time within the
-    scene's audio.
+    Resolve an input-text character offset to a time within the audio.
 
-    ElevenLabs may normalize the text before alignment (expanding em-dashes,
-    collapsing whitespace, etc.), so the alignment `characters` array can be
-    a slightly different length than the input. We linearly interpolate:
-    take char_offset / len(input_text) and find the matching position in the
-    alignment array. This is robust against length mismatch and never
-    overshoots the audio duration.
+    ElevenLabs may normalize the input text before alignment, so the
+    `characters` array can be a slightly different length than the input.
+    Linearly interpolate by ratio so anchors land in the right
+    neighborhood even if exact char counts disagree.
     """
     starts: list[float] = alignment.get("character_start_times_seconds") or []
     n = len(starts)
     if n == 0:
         return min(char_offset, 1) * fallback_duration
 
-    # Map by ratio rather than direct indexing.
-    ratio = max(0.0, min(1.0, char_offset / max(len(alignment.get("characters") or []), 1)))
+    aligned_chars = len(alignment.get("characters") or []) or 1
+    ratio = max(0.0, min(1.0, char_offset / aligned_chars))
     idx = min(int(round(ratio * (n - 1))), n - 1)
     return float(starts[idx])
 
 
+def _derive_captions(
+    narration: str, alignment: dict[str, Any], fps: int
+) -> list[dict[str, Any]]:
+    """
+    Group the narration into caption-sized chunks (one per ~6 words or
+    until a clause-ending punctuation), and resolve their start/end frame
+    from the alignment data.
+    """
+    starts = alignment.get("character_start_times_seconds") or []
+    ends = alignment.get("character_end_times_seconds") or []
+    if not starts or not ends:
+        return []
+
+    aligned_n = len(starts)
+    src_n = len(narration)
+    if src_n == 0:
+        return []
+
+    def char_time(idx: int, table: list[float]) -> float:
+        ratio = max(0.0, min(1.0, idx / src_n))
+        ai = min(int(round(ratio * (aligned_n - 1))), aligned_n - 1)
+        return float(table[ai])
+
+    word_pattern = re.compile(r"\S+")
+    word_spans = [(m.start(), m.end()) for m in word_pattern.finditer(narration)]
+    if not word_spans:
+        return []
+
+    captions: list[dict[str, Any]] = []
+    chunk: list[tuple[int, int]] = []
+    for span in word_spans:
+        chunk.append(span)
+        word_text = narration[span[0]:span[1]]
+        last_char = word_text[-1] if word_text else ""
+        if len(chunk) >= CAPTION_TARGET_WORDS or last_char in CAPTION_BREAK_PUNCT:
+            captions.append(_finalize_caption(chunk, narration, char_time, starts, ends, fps))
+            chunk = []
+    if chunk:
+        captions.append(_finalize_caption(chunk, narration, char_time, starts, ends, fps))
+
+    # Snap end_frame[i] = start_frame[i+1] so there's no gap/overlap.
+    for i in range(len(captions) - 1):
+        captions[i]["end_frame"] = captions[i + 1]["start_frame"]
+    if captions:
+        last_end = round(_alignment_duration(alignment) * fps)
+        captions[-1]["end_frame"] = max(captions[-1]["end_frame"], last_end)
+    return captions
+
+
+def _finalize_caption(
+    chunk: list[tuple[int, int]],
+    narration: str,
+    char_time,
+    starts: list[float],
+    ends: list[float],
+    fps: int,
+) -> dict[str, Any]:
+    first_char = chunk[0][0]
+    last_char = chunk[-1][1] - 1
+    text = narration[first_char : chunk[-1][1]].strip()
+    return {
+        "text": text,
+        "start_frame": round(char_time(first_char, starts) * fps),
+        "end_frame": round(char_time(last_char, ends) * fps),
+    }
+
+
+def _scale_shots(
+    shots: list[dict[str, Any]], total_seconds: float, fps: int
+) -> list[dict[str, Any]]:
+    """
+    Director plans shots with target_seconds. Actual TTS audio is
+    `total_seconds`. Scale every shot proportionally so they sum to
+    exactly the audio length, snap to whole frames, and have the last
+    shot absorb the rounding remainder.
+    """
+    if not shots:
+        return []
+    target_total = sum(float(s.get("target_seconds", 0)) for s in shots)
+    if target_total <= 0:
+        # Fall back: equal split.
+        per = total_seconds / len(shots)
+        target_total = per * len(shots)
+        for s in shots:
+            s["target_seconds"] = per
+
+    scale = total_seconds / target_total
+    out: list[dict[str, Any]] = []
+    cursor_frame = 0
+    for i, shot in enumerate(shots):
+        scaled_seconds = float(shot["target_seconds"]) * scale
+        if i == len(shots) - 1:
+            end_frame = round(total_seconds * fps)
+        else:
+            end_frame = cursor_frame + max(1, round(scaled_seconds * fps))
+        out.append(
+            {
+                "id": shot["id"],
+                "complexity": shot.get("complexity", "simple"),
+                "start_frame": cursor_frame,
+                "end_frame": end_frame,
+            }
+        )
+        cursor_frame = end_frame
+    return out
+
+
 def synthesize_script(
-    narrations: list[SceneNarration],
+    script: dict[str, Any],
     out_dir: Path,
     fps: int = 30,
 ) -> dict[str, Any]:
     """
-    Generate audio.wav and timing.json from a list of scene narrations.
+    Generate audio.mp3 + timing.json from a parsed script.json.
 
-    Args:
-        narrations: Ordered list of per-scene narration payloads.
-        out_dir: Directory to write `public/audio.wav` and `timing.json`.
-                 (The Remotion project's `public/` is the convention for
-                 staticFile() assets — see the remotion-best-practices skill.)
-        fps: Project frame rate. Anchors snap to integer frames.
+    `script` shape:
+      {
+        "fps": 30,
+        "narration": "Continuous voiceover string.",
+        "anchors": [{"id": "...", "char_offset": int, "shot": "shotNN"}],
+        "shots":   [{"id": "...", "complexity": "...", "target_seconds": float, "visual": "..."}]
+      }
 
-    Returns:
-        The timing dict that was written to timing.json.
+    Returns the timing dict that was written.
     """
     api_key = _require_api_key()
     voice_id = _voice_id()
+
+    narration = script.get("narration") or ""
+    if not narration.strip():
+        raise TTSError("script.narration is empty — Phase A produced no voiceover")
+
+    anchors_in = script.get("anchors") or []
+    shots_in = script.get("shots") or []
+    if not shots_in:
+        raise TTSError("script.shots is empty — Phase A produced no shot list")
 
     public_dir = out_dir / "public"
     public_dir.mkdir(parents=True, exist_ok=True)
     audio_path = public_dir / AUDIO_FILENAME
 
-    all_audio = bytearray()
-    anchors: list[dict[str, Any]] = []
-    scenes: list[dict[str, Any]] = []
-    elapsed_seconds = 0.0
+    print(f"[tts] synthesizing {len(narration)} chars of narration")
+    resp = _call_elevenlabs(narration, api_key, voice_id)
 
-    for scene in narrations:
-        print(f"[tts] synthesizing {scene.scene_id} ({len(scene.text)} chars)")
-        resp = _call_elevenlabs(scene.text, api_key, voice_id)
+    audio_b64 = resp.get("audio_base64") or resp.get("audio")
+    if not audio_b64:
+        raise TTSError("ElevenLabs returned no audio")
+    audio_path.write_bytes(base64.b64decode(audio_b64))
 
-        audio_b64 = resp.get("audio_base64") or resp.get("audio")
-        if not audio_b64:
-            raise TTSError(f"No audio in response for {scene.scene_id}")
-        audio_bytes = base64.b64decode(audio_b64)
+    alignment = resp.get("alignment") or {}
+    total_seconds = _alignment_duration(alignment)
+    if total_seconds <= 0:
+        raise TTSError("ElevenLabs returned no usable alignment data")
+    total_frames = round(total_seconds * fps)
 
-        alignment = resp.get("alignment") or {}
-        scene_duration = _alignment_duration(alignment)
-        if scene_duration <= 0:
-            raise TTSError(
-                f"ElevenLabs returned no usable alignment data for {scene.scene_id}"
+    # Scale shots to fit actual audio duration.
+    shots_out = _scale_shots(shots_in, total_seconds, fps)
+
+    # Resolve anchors against the continuous narration, then re-bind each
+    # anchor to whichever shot's frame range actually contains it. Phase A
+    # assigned anchors to shots based on the planned timeline, but TTS
+    # scaling can shift the boundaries — the post-scaling assignment is
+    # the source of truth, so the right shot agent owns each anchor.
+    def _shot_containing(frame: int) -> str | None:
+        for s in shots_out:
+            if s["start_frame"] <= frame < s["end_frame"]:
+                return s["id"]
+        # Anchor at the very last frame — clamp to the final shot.
+        return shots_out[-1]["id"] if shots_out else None
+
+    anchors_out: list[dict[str, Any]] = []
+    for a in anchors_in:
+        seconds = _char_offset_to_seconds(int(a["char_offset"]), alignment, total_seconds)
+        frame = max(0, min(total_frames, round(seconds * fps)))
+        actual_shot = _shot_containing(frame)
+        planned_shot = a.get("shot")
+        if planned_shot and actual_shot and planned_shot != actual_shot:
+            print(
+                f"[tts] anchor {a['id']} reassigned: planned {planned_shot} → "
+                f"actual {actual_shot} (frame {frame})"
             )
-
-        scene_start_seconds = elapsed_seconds
-        scene_start_frame = round(scene_start_seconds * fps)
-        scene_end_seconds = scene_start_seconds + scene_duration
-        scene_end_frame = round(scene_end_seconds * fps)
-
-        # Scene start anchor (always emitted).
-        anchors.append(
+        anchors_out.append(
             {
-                "id": f"{scene.scene_id}.start",
-                "frame": scene_start_frame,
-                "seconds": round(scene_start_seconds, 4),
+                "id": a["id"],
+                "frame": frame,
+                "shot": actual_shot,
             }
         )
 
-        # Resolve each declared char-offset anchor inside the scene, then
-        # clamp the resulting frame to (start, end) so the contract holds
-        # even if the director picks an offset near the boundary.
-        for anchor_id, char_offset in scene.anchor_char_offsets:
-            rel_seconds = _char_offset_to_seconds(
-                char_offset, alignment, scene_duration
-            )
-            abs_seconds = scene_start_seconds + rel_seconds
-            frame = round(abs_seconds * fps)
-            frame = max(scene_start_frame, min(scene_end_frame, frame))
-            anchors.append(
-                {
-                    "id": anchor_id,
-                    "frame": frame,
-                    "seconds": round(frame / fps, 4),
-                }
-            )
-
-        scenes.append(
-            {
-                "id": scene.scene_id,
-                "start_frame": scene_start_frame,
-                "end_frame": scene_end_frame,
-            }
-        )
-        # Scene end anchor.
-        anchors.append(
-            {
-                "id": f"{scene.scene_id}.end",
-                "frame": scene_end_frame,
-                "seconds": round(scene_end_seconds, 4),
-            }
-        )
-
-        all_audio.extend(audio_bytes)
-        elapsed_seconds = scene_end_seconds
-
-    audio_path.write_bytes(bytes(all_audio))
-    total_frames = round(elapsed_seconds * fps)
+    # Derive captions from per-character alignment.
+    captions = _derive_captions(narration, alignment, fps)
 
     timing = {
         "fps": fps,
         "audio_path": f"public/{AUDIO_FILENAME}",
         "total_frames": total_frames,
-        "anchors": sorted(anchors, key=lambda a: a["frame"]),
-        "scenes": scenes,
+        "anchors": sorted(anchors_out, key=lambda a: a["frame"]),
+        "shots": shots_out,
+        "captions": captions,
     }
 
     timing_path = out_dir / "timing.json"
     timing_path.write_text(json.dumps(timing, indent=2))
     print(
-        f"[tts] wrote {audio_path} ({elapsed_seconds:.2f}s, {total_frames} frames) "
-        f"and {timing_path} ({len(anchors)} anchors)"
+        f"[tts] wrote {audio_path} ({total_seconds:.2f}s, {total_frames} frames), "
+        f"{len(anchors_out)} anchors, {len(shots_out)} shots, {len(captions)} captions"
     )
     return timing
 
 
-def load_narrations_from_script(script_path: Path) -> list[SceneNarration]:
-    """
-    Parse script.json (written by the director in Phase A) into SceneNarration.
-
-    script.json schema (director's contract):
-    {
-      "fps": 30,
-      "scenes": [
-        {
-          "id": "scene1",
-          "narration": "Full text of this scene's voiceover.",
-          "anchors": [
-            {"id": "scene1.beat1", "char_offset": 42},
-            {"id": "scene1.beat2", "char_offset": 88}
-          ]
-        }
-      ]
-    }
-    """
+def load_script(script_path: Path) -> dict[str, Any]:
+    """Load and validate the Phase A script.json."""
     data = json.loads(script_path.read_text())
-    result = []
-    for scene in data.get("scenes", []):
-        anchors = [
-            (a["id"], int(a["char_offset"])) for a in scene.get("anchors", [])
-        ]
-        result.append(
-            SceneNarration(
-                scene_id=scene["id"],
-                text=scene["narration"],
-                anchor_char_offsets=sorted(anchors, key=lambda x: x[1]),
-            )
-        )
-    return result
+    if "narration" not in data:
+        raise TTSError("script.json missing 'narration'")
+    if "shots" not in data:
+        raise TTSError("script.json missing 'shots'")
+    data.setdefault("anchors", [])
+    return data

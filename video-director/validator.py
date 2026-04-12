@@ -1,13 +1,22 @@
 """
 Alignment test runner — the enforcement half of "every frame lands on its mark".
 
-Phase A writes `alignment.test.ts` into the project. This module runs it via
-vitest and parses results so director.py can gate Phase B and Phase C on a
-green test run.
+In the shot-list model, the test verifies two contracts:
 
-The test file is generated (not hand-written) so its shape is known: one
-test per anchor in timing.json, each asserting the component's actual frame
-is within ±1 frame of the declared anchor frame.
+  1. Every anchor declared in timing.json is registered in src/anchors.ts
+     within ±1 frame of its declared frame. (Each anchor has an owning
+     `shot` that the Phase B agent for that shot is responsible for
+     placing the keyframe.)
+
+  2. Every shot declared in timing.json has a Shot{N}.tsx component file.
+     The shot's start/end frames are placed by the compositor at Root
+     level, but the file's existence is the proof that the shot agent
+     ran. We don't unit-test the visuals.
+
+The generated `alignment.test.ts` only encodes contract (1) — it imports
+timing.json and src/anchors.ts and asserts every anchor resolves. The
+shot-existence check happens in Python (validator.run_alignment_test
+verifies file presence before invoking vitest).
 """
 
 from __future__ import annotations
@@ -27,27 +36,25 @@ class ValidationResult:
     passed: bool
     total: int
     failures: list[str] = field(default_factory=list)
+    missing_shots: list[str] = field(default_factory=list)
     stderr: str = ""
 
     def summary(self) -> str:
         if self.passed:
             return f"alignment: {self.total}/{self.total} anchors within ±{TOLERANCE_FRAMES} frame"
-        return (
-            f"alignment: {self.total - len(self.failures)}/{self.total} passing — "
-            f"{len(self.failures)} off-target"
-        )
+        bits = []
+        if self.failures:
+            bits.append(
+                f"{self.total - len(self.failures)}/{self.total} anchors passing — "
+                f"{len(self.failures)} off-target"
+            )
+        if self.missing_shots:
+            bits.append(f"{len(self.missing_shots)} shot file(s) missing")
+        return "alignment: " + "; ".join(bits) if bits else "alignment: failed"
 
 
 def generate_alignment_test(project_dir: Path, timing_path: Path) -> Path:
-    """
-    Write alignment.test.ts into the project.
-
-    The generated test imports timing.json and the Remotion composition,
-    then asserts every anchor resolves to the declared frame within tolerance.
-    Scene components must expose an `anchors` export mapping anchor id →
-    actual frame used by the component (a keyframe, a Sequence `from`, etc.).
-    This is the contract Phase B scene agents must satisfy.
-    """
+    """Write alignment.test.ts into the project."""
     test_path = project_dir / "alignment.test.ts"
     test_path.write_text(
         f"""import {{ describe, test, expect }} from "vitest";
@@ -70,15 +77,30 @@ describe("frame alignment invariant", () => {{
     return test_path
 
 
+def _check_shot_files(project_dir: Path, timing: dict) -> list[str]:
+    """Return shot ids whose .tsx file is missing."""
+    shots_dir = project_dir / "src" / "shots"
+    missing = []
+    for shot in timing.get("shots", []):
+        sid = shot["id"]
+        # shot01 → Shot01.tsx
+        suffix = sid.replace("shot", "").lstrip("0") or "0"
+        path_a = shots_dir / f"Shot{sid.replace('shot', '').zfill(2)}.tsx"
+        path_b = shots_dir / f"Shot{suffix}.tsx"
+        if not path_a.exists() and not path_b.exists():
+            missing.append(sid)
+    return missing
+
+
 def run_alignment_test(project_dir: Path) -> ValidationResult:
     """
-    Run `npx vitest run alignment.test.ts` and parse the result.
-
-    vitest's default reporter prints a passing count line and one `FAIL`
-    line per failing test. That's enough to build a ValidationResult.
+    Run the alignment test plus a Python-side check that every shot file
+    exists. Returns a unified ValidationResult.
     """
     timing = json.loads((project_dir / "timing.json").read_text())
     total = len(timing.get("anchors", []))
+
+    missing_shots = _check_shot_files(project_dir, timing)
 
     proc = subprocess.run(
         ["npx", "vitest", "run", "alignment.test.ts", "--reporter=verbose"],
@@ -89,37 +111,35 @@ def run_alignment_test(project_dir: Path) -> ValidationResult:
     stdout = proc.stdout
     stderr = proc.stderr
 
-    if proc.returncode == 0:
-        return ValidationResult(passed=True, total=total, stderr=stderr)
+    failures: list[str] = []
+    if proc.returncode != 0:
+        patterns = [
+            re.compile(r">\s*(\S+)\s+lands within"),    # vitest verbose
+            re.compile(r"[×✗]\s+(\S+)\s+lands within"),  # alt symbol form
+        ]
+        # Vitest splits output across stdout and stderr depending on the
+        # reporter and the kind of message. Search both.
+        for line in (stdout + "\n" + stderr).splitlines():
+            for pat in patterns:
+                m = pat.search(line)
+                if m:
+                    failures.append(m.group(1))
+                    break
+        # Dedupe, preserve order
+        seen = set()
+        ordered = []
+        for f in failures:
+            if f not in seen:
+                seen.add(f)
+                ordered.append(f)
+        failures = ordered
 
-    # Collect failing anchor ids from vitest output. Vitest 1.x verbose
-    # reporter prints either:
-    #   FAIL  alignment.test.ts > frame alignment invariant > scene1.start lands within ±1 frame of 0
-    # or:
-    #   × scene1.start lands within ±1 frame of 0
-    # We accept either form.
-    failures = []
-    patterns = [
-        re.compile(r"FAIL\s+\S+.*?>\s*(\S+)\s+lands within"),
-        re.compile(r"[×✗]\s+(\S+)\s+lands within"),
-    ]
-    for line in stdout.splitlines():
-        for pat in patterns:
-            m = pat.search(line)
-            if m:
-                failures.append(m.group(1))
-                break
-    # Dedupe, preserve order.
-    seen = set()
-    ordered_failures = []
-    for f in failures:
-        if f not in seen:
-            seen.add(f)
-            ordered_failures.append(f)
-
+    passed = proc.returncode == 0 and not missing_shots
+    combined_tail = ((stderr or "") + "\n" + (stdout or ""))[-2000:]
     return ValidationResult(
-        passed=False,
+        passed=passed,
         total=total,
-        failures=ordered_failures,
-        stderr=stderr or stdout[-2000:],
+        failures=failures,
+        missing_shots=missing_shots,
+        stderr=combined_tail if not passed else "",
     )
