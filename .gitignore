@@ -1,3 +1,17 @@
 # deps
 node_modules/
 .pnpm-store/
+
+# python venv
+myvenv/
+__pycache__/
+*.pyc
+
+# video-director generated artifacts (infra only — no media in git)
+*.mp4
+*.mp3
+*.wav
+*.webm
+*.mov
+out/
+public/audio.*
