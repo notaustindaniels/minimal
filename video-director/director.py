@@ -233,7 +233,9 @@ def scaffold_project(project_dir: Path, spec_path: Path, install: bool = True) -
     (project_dir / "public").mkdir(parents=True, exist_ok=True)
     (project_dir / "out").mkdir(parents=True, exist_ok=True)
 
-    shutil.copy(spec_path, project_dir / "video_spec.xml")
+    spec_dest = project_dir / "video_spec.xml"
+    if spec_path.resolve() != spec_dest.resolve():
+        shutil.copy(spec_path, spec_dest)
 
     (project_dir / "package.json").write_text(
         json.dumps(REMOTION_PACKAGE_JSON, indent=2)
@@ -314,6 +316,50 @@ def scenes_owning_anchors(anchor_ids: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 # Phase runners
 # ---------------------------------------------------------------------------
+
+
+def _stage_refactor_inputs(project_dir: Path, brief_path: Path) -> None:
+    """Copy brief.md and the spec template into project_dir for Phase 0."""
+    project_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy(brief_path, project_dir / "brief.md")
+    shutil.copy(
+        PHASE_PROMPTS / "video_spec_template.xml",
+        project_dir / "video_spec_template.xml",
+    )
+
+
+async def run_phase_0_refactor(project_dir: Path, model: str) -> Path:
+    """
+    Spec refactor agent: reads brief.md + video_spec_template.xml from
+    project_dir and writes a concrete video_spec.xml. Returns the path to
+    the produced spec.
+    """
+    print("\n" + "=" * 70)
+    print("  PHASE 0 — Spec Refactor")
+    print("=" * 70 + "\n")
+
+    client = _build_client(
+        project_dir=project_dir,
+        model=model,
+        system_prompt=(
+            "You are a video spec writer. Read brief.md + the template, "
+            "write video_spec.xml. Nothing else."
+        ),
+        allowed_writes=["Write(video_spec.xml)", "Edit(video_spec.xml)"],
+    )
+    prompt = _load_prompt("refactor_prompt.md")
+    async with client:
+        status, _ = await run_agent_session(client, prompt, project_dir)
+    if status != "continue":
+        raise RuntimeError("Phase 0 (spec refactor) failed")
+
+    spec_path = project_dir / "video_spec.xml"
+    if not spec_path.exists():
+        raise RuntimeError(
+            "Phase 0 finished without writing video_spec.xml. "
+            "Check the refactor agent's output above."
+        )
+    return spec_path
 
 
 async def run_phase_a(project_dir: Path, model: str) -> None:
@@ -470,18 +516,29 @@ def _preflight() -> None:
 async def main_async(args: argparse.Namespace) -> None:
     _preflight()
 
-    spec_path = Path(args.spec).resolve()
-    if not spec_path.exists():
-        print(f"Error: spec not found at {spec_path}")
-        sys.exit(1)
-
     project_dir = Path(args.out).resolve()
+
+    if args.brief:
+        # Phase 0: stage inputs, run refactor agent, then proceed with the
+        # spec it produced.
+        brief_path = Path(args.brief).resolve()
+        if not brief_path.exists():
+            print(f"Error: brief not found at {brief_path}")
+            sys.exit(1)
+        _stage_refactor_inputs(project_dir, brief_path)
+        spec_path = await run_phase_0_refactor(project_dir, args.model)
+    else:
+        spec_path = Path(args.spec).resolve()
+        if not spec_path.exists():
+            print(f"Error: spec not found at {spec_path}")
+            sys.exit(1)
+
     scaffold_project(project_dir, spec_path)
 
     # Phase A: director agent → script.json
     await run_phase_a(project_dir, args.model)
 
-    # Driver: TTS → audio.wav + timing.json
+    # Driver: TTS → audio.mp3 + timing.json
     narrations = load_narrations_from_script(project_dir / "script.json")
     synthesize_script(narrations, project_dir, fps=args.fps)
 
@@ -494,7 +551,15 @@ async def main_async(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Remotion video one-shot harness")
-    parser.add_argument("--spec", required=True, help="Path to video_spec.xml")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--spec", help="Path to a hand-written video_spec.xml")
+    source.add_argument(
+        "--brief",
+        help=(
+            "Path to a brief.md (topic + answers). Phase 0 spec refactor agent "
+            "will turn it into video_spec.xml before the rest of the harness runs."
+        ),
+    )
     parser.add_argument("--out", required=True, help="Project output directory")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--fps", type=int, default=30)
