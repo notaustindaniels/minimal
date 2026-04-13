@@ -36,10 +36,27 @@ Your shot id is injected at the bottom of this prompt as `SHOT_ID`.
    **not** prescribe palette, typography, or composition — those are
    your call.
 
-5. `assets.json` — catalog of Wikipedia-sourced photos. Each entry has
-   `filename`, `wikipedia_title`, `search_term`, `dimensions`, `reason`.
-   If one fits your shot, use it at full-bleed with a Ken Burns move.
-   If none fit, go fully code-generated.
+5. **Your asset catalog**. Two cases:
+
+   - **Default**: read `assets.json` at the project root. This is the
+     full Wikipedia-sourced photo catalog for the topic. Each entry
+     has `filename`, `wikipedia_title`, `search_term`, `dimensions`,
+     `reason`.
+
+   - **Override (collision rerun)**: if a file named
+     `<your_shot_id>.assets.json` (e.g. `shot07.assets.json`) exists
+     at the project root, **read that file instead of `assets.json`**.
+     The harness writes this file when a previous version of your
+     shot collided with a neighboring shot's asset choice — entries
+     that would cause a re-collision have been physically removed
+     from your view. The override file may even be empty `[]`, in
+     which case you go fully code-generated for this shot. Treat
+     the override file as the only source of truth for your asset
+     options; do not import any asset that isn't in it.
+
+   In either case: if a relevant photo is in your catalog, use it
+   at full-bleed with a Ken Burns move. If nothing fits or your
+   override is empty, go fully code-generated.
 
 You do NOT need to read other shots' files, script.json's other
 phrases, or any other shot's anchors. You work in isolation.

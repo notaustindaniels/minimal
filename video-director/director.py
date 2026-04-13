@@ -460,6 +460,194 @@ def _shot_suffix(shot_id: str) -> str:
     return f"{int(n):02d}"
 
 
+def _extract_assets_from_shot_file(project_dir: Path, shot_id: str) -> set[str]:
+    """Scan a shot's .tsx for staticFile('assets/...') references."""
+    import re
+
+    suffix = _shot_suffix(shot_id)
+    path = project_dir / "src" / "shots" / f"Shot{suffix}.tsx"
+    if not path.exists():
+        return set()
+    content = path.read_text()
+    matches = re.findall(r'staticFile\(["\']assets/([^"\']+)["\']\)', content)
+    return {f"assets/{m}" for m in matches}
+
+
+def _find_adjacent_asset_collisions(
+    project_dir: Path, timing: dict
+) -> list[tuple[str, list[str]]]:
+    """
+    Walk shots in timing order and return adjacent collisions.
+
+    For each pair (shot N, shot N+1) where shot N+1 imports any asset
+    that shot N also imports, emit (shot_id_N+1, sorted_list_of_collisions).
+    """
+    shots = timing.get("shots", [])
+    collisions: list[tuple[str, list[str]]] = []
+    prev_assets: set[str] = set()
+    for shot in shots:
+        sid = shot["id"]
+        my_assets = _extract_assets_from_shot_file(project_dir, sid)
+        overlap = my_assets & prev_assets
+        if overlap:
+            collisions.append((sid, sorted(overlap)))
+        prev_assets = my_assets
+    return collisions
+
+
+def _write_shot_assets_override(
+    project_dir: Path,
+    shot_id: str,
+    all_assets: list[dict],
+    exclusions: set[str],
+) -> Path:
+    """
+    Write the per-shot asset catalog override at <project_dir>/<shot_id>.assets.json.
+
+    Contains the global assets.json catalog with any entries whose
+    `filename` is in `exclusions` removed. Shot agents are instructed
+    by shot_prompt.md to read this file IF it exists, instead of
+    assets.json.
+    """
+    filtered = [a for a in all_assets if a.get("filename") not in exclusions]
+    path = project_dir / f"{shot_id}.assets.json"
+    path.write_text(json.dumps(filtered, indent=2))
+    return path
+
+
+async def run_shot_redo(
+    project_dir: Path,
+    model: str,
+    shot_id: str,
+    semaphore: asyncio.Semaphore,
+) -> tuple[str, str]:
+    """
+    Re-run a shot agent. Identical to run_phase_b_shot, except the
+    semaphore is shared with whatever loop is calling it. The agent
+    uses the standard shot_prompt.md — exclusions are enforced by the
+    per-shot override file, not by prompt injection.
+    """
+    suffix = _shot_suffix(shot_id)
+    allowed_writes = [
+        f"Write(src/shots/Shot{suffix}.tsx)",
+        f"Edit(src/shots/Shot{suffix}.tsx)",
+        f"Write(src/shots/Shot{suffix}.anchors.json)",
+        f"Edit(src/shots/Shot{suffix}.anchors.json)",
+    ]
+    async with semaphore:
+        client = _build_client(
+            project_dir=project_dir,
+            model=model,
+            system_prompt=(
+                f"You are the shot agent for {shot_id}, re-running because a "
+                "previous version collided with a neighbor's asset choice. "
+                "Read your per-shot asset override file and pick a different "
+                "visual approach."
+            ),
+            allowed_writes=allowed_writes,
+        )
+        prompt = _load_prompt("shot_prompt.md") + f"\n\n## SHOT_ID\n\n{shot_id}\n"
+        async with client:
+            status, response = await run_agent_session(client, prompt, project_dir)
+        return status, response
+
+
+async def run_asset_diversity_pass(
+    project_dir: Path,
+    model: str,
+) -> None:
+    """
+    Reactive diversity check, loop-until-clean.
+
+    After Phase B passes alignment, scan adjacent shots for shared
+    asset usage. For each colliding shot, accumulate a persistent
+    exclusion set, write a per-shot override file with the colliding
+    assets physically removed from the catalog, and respawn the shot
+    agent. Re-stitch anchors + re-run alignment test. Loop.
+
+    Termination: each iteration adds at least one entry to one
+    shot's exclusion set. Maximum exclusion size per shot equals the
+    number of available assets. Once a shot's override file is empty,
+    the agent goes fully code-generated and cannot collide. Bound:
+    `len(shots) × len(assets)` iterations, typically 1–2.
+
+    A safety cap of `max(20, len(shots) × len(assets))` guards against
+    agents ignoring the override file.
+    """
+    timing = json.loads((project_dir / "timing.json").read_text())
+    assets_path = project_dir / "assets.json"
+    if not assets_path.exists():
+        print("[diversity] no assets.json — skipping diversity pass")
+        return
+
+    all_assets = json.loads(assets_path.read_text())
+    if len(all_assets) < 2:
+        print(f"[diversity] only {len(all_assets)} asset(s) — diversity pass not meaningful, skipping")
+        return
+
+    n_shots = len(timing.get("shots", []))
+    safety_bound = max(20, n_shots * len(all_assets))
+    exclusions: dict[str, set[str]] = {}
+    semaphore = asyncio.Semaphore(5)
+
+    iteration = 0
+    while True:
+        iteration += 1
+        if iteration > safety_bound:
+            print(
+                f"[diversity] safety bound ({safety_bound}) hit — stopping "
+                "(agent likely ignored override file)"
+            )
+            return
+
+        collisions = _find_adjacent_asset_collisions(project_dir, timing)
+        if not collisions:
+            if iteration == 1:
+                print("[diversity] iteration 1: no adjacent reuse — skipping")
+            else:
+                print(f"[diversity] iteration {iteration}: clean — exiting")
+            return
+
+        print(
+            f"[diversity] iteration {iteration}: found {len(collisions)} "
+            f"adjacent collision(s): {[(c[0], c[1]) for c in collisions]}"
+        )
+
+        # Accumulate exclusions and write override files for each colliding shot.
+        rerun_shots: list[str] = []
+        for shot_id, colliding in collisions:
+            exclusions.setdefault(shot_id, set()).update(colliding)
+            override_path = _write_shot_assets_override(
+                project_dir, shot_id, all_assets, exclusions[shot_id]
+            )
+            remaining = len(all_assets) - len(exclusions[shot_id])
+            print(
+                f"[diversity] writing {override_path.name} "
+                f"(excluded: {sorted(exclusions[shot_id])}, {remaining} remain)"
+            )
+            rerun_shots.append(shot_id)
+
+        # Reroll the colliding shots in parallel, semaphore-limited.
+        results = await asyncio.gather(
+            *(run_shot_redo(project_dir, model, sid, semaphore) for sid in rerun_shots),
+            return_exceptions=True,
+        )
+        for sid, res in zip(rerun_shots, results):
+            if isinstance(res, Exception):
+                print(f"[diversity] reroll {sid} raised: {res}")
+
+        # Re-stitch anchors and re-run alignment test.
+        n_anchors = stitch_anchors(project_dir)
+        print(f"[diversity] re-stitched {n_anchors} anchors after reroll")
+        result = run_alignment_test(project_dir)
+        print(f"[diversity] post-reroll alignment: {result.summary()}")
+        if not result.passed:
+            raise RuntimeError(
+                f"Diversity reroll broke the alignment test.\n"
+                f"Failures: {result.failures}\n{result.stderr[:500]}"
+            )
+
+
 async def run_phase_b_shot(
     shot_id: str,
     project_dir: Path,
@@ -897,10 +1085,15 @@ async def main_async(args: argparse.Namespace) -> None:
     script = load_script(project_dir / "script.json")
     synthesize_script(script, project_dir, fps=args.fps)
 
-    # Phase B: parallel scene agents (with alignment retry loop)
+    # Phase B: parallel shot agents (with alignment retry loop)
     await run_phase_b(project_dir, args.model, max_retries=args.max_scene_retries)
 
-    # Phase C: compositor → render
+    # Asset diversity pass: detect adjacent-shot photo reuse, reroll
+    # offending shots with the colliding asset(s) hidden via per-shot
+    # override files. Loops until clean.
+    await run_asset_diversity_pass(project_dir, args.model)
+
+    # Phase C: compositor → render (with patch retry on render failure)
     await run_phase_c(project_dir, args.model)
 
 
