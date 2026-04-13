@@ -141,47 +141,102 @@ Everything below is yours to decide. Don't ask permission.
   `@remotion/transitions` for layered reveals **inside your shot**
   (not at Root — that breaks the timeline).
 
-## Image fetching helper
+## Pre-fetched imagery
 
-If your brief includes an "Image fetching" block with a
-`python tools/fetch_image.py ...` command, run it via Bash before
-writing your component. It:
+If your brief includes an "Image fetching" block, **the harness has
+already run that fetch for you before you started**. The image and
+its saliency sidecar are already on disk. You do NOT run
+`tools/fetch_image.py` yourself. Just reference the files:
 
-1. Fetches a high-resolution photo (up to 6000+ px wide) from Pexels
-   (primary), with Pixabay/Wikipedia fallbacks if Pexels is down.
-2. Saves it to the path your brief specifies
-   (`public/assets/shot{NN}_hero.jpg`).
-3. Runs U2-Net small to compute the **subject bounding box** and
-   writes it to a sidecar JSON next to the image
-   (e.g. `public/assets/shot04_hero.jpg.json`) with both absolute and
-   normalized coordinates.
+- **Image**: `public/assets/shot{NN}_hero.jpg` (or whatever path your
+  brief specified)
+- **Saliency sidecar**: same path + `.json`, e.g.
+  `public/assets/shot04_hero.jpg.json`
 
-Read that sidecar. It has `subject_bbox_normalized` as `{x, y, w, h}`
-in 0..1. That's where the subject actually is in the frame. Position
-your overlay typography in the complement of that rectangle — real
-negative space, not wherever you feel like — so the subject stays
-readable.
+Read the sidecar. It has `subject_bbox_normalized` as `{x, y, w, h}`
+in 0..1 — that's where the actual subject of the photo lives in the
+frame. Position any overlay typography OUTSIDE that rectangle so the
+subject stays visible.
 
-Example: if the bbox is `{x: 0.43, y: 0.46, w: 0.34, h: 0.27}` the
-subject is center-right. Put your headline on the left third, not on
-top of the bird.
+### Worked example — saliency-aware text placement
 
-### Sandbox retry — IMPORTANT
+Suppose the sidecar says:
+```json
+{"subject_bbox_normalized": {"x": 0.43, "y": 0.46, "w": 0.34, "h": 0.27}}
+```
 
-Your Bash calls run inside a sandbox that blocks outbound HTTPS by
-default. **The first call to `python tools/fetch_image.py` will fail**
-with a message like `Tunnel connection failed: 403 Forbidden` or
-`urlopen error` — that's the sandbox, not the API.
+The subject occupies the rectangle from (43%, 46%) to (77%, 73%) of
+the frame — roughly center-right. The available negative-space zones,
+in order of size, are:
 
-When this happens, **immediately retry the EXACT same Bash command
-with `dangerouslyDisableSandbox: True`**. The retry will succeed. This
-is the same pattern the compositor uses for the Chromium download on
-Phase C first-runs.
+1. **Left gutter** — (0%, 0%) to (43%, 100%). 43% of frame width.
+2. **Bottom strip** — (0%, 73%) to (100%, 100%). 27% of frame height.
+3. **Top strip** — (0%, 0%) to (100%, 46%). 46% of frame height.
+4. **Right gutter** — (77%, 0%) to (100%, 100%). 23% of frame width.
 
-Do NOT interpret the first failure as "Pexels is down" or "the image
-doesn't exist" — retry once with sandbox disabled before falling back
-to a code-only shot. The image source chain (Pexels → Pixabay →
-Wikipedia) only kicks in if the sandbox-disabled retry ALSO fails.
+Pick the zone that best fits your typographic element. A single 400pt
+headline belongs in the left gutter. A thin horizontal data strip
+belongs in the bottom strip. A top-of-frame metadata bar belongs in
+the top strip.
+
+```tsx
+import timing from "../../timing.json";
+import sidecar from "../../public/assets/shot04_hero.jpg.json";
+import { AbsoluteFill, Img, staticFile, useCurrentFrame, interpolate } from "remotion";
+
+const WIDTH = 1920;
+const HEIGHT = 1080;
+
+export const Shot04: React.FC = () => {
+  const frame = useCurrentFrame();
+  const bbox = sidecar.subject_bbox_normalized; // {x, y, w, h} in 0..1
+
+  // Compute the left-gutter negative-space rectangle.
+  const leftGutterRight = bbox.x * WIDTH; // pixels from left edge
+
+  const scale = interpolate(frame, [0, 120], [1.0, 1.12], {
+    extrapolateRight: "clamp",
+  });
+
+  return (
+    <AbsoluteFill>
+      <Img
+        src={staticFile("assets/shot04_hero.jpg")}
+        style={{
+          width: "100%",
+          height: "100%",
+          objectFit: "cover",
+          transform: `scale(${scale})`,
+        }}
+      />
+      <div
+        style={{
+          position: "absolute",
+          left: 60,
+          top: 160,
+          width: leftGutterRight - 120, // stay inside the gutter
+          fontFamily, // loaded from @remotion/google-fonts/BebasNeue
+          fontSize: 320,
+          fontWeight: 700,
+          color: "#FFF8E7",
+          lineHeight: 0.9,
+        }}
+      >
+        1,200
+      </div>
+    </AbsoluteFill>
+  );
+};
+```
+
+This is the canonical pattern. Read your sidecar, compute the gutter,
+place text. Do not cover the subject.
+
+### What if your brief has no "Image fetching" block
+
+Not every shot gets a photo. If your brief has no `## Image fetching`
+section, you go fully code-generated — no `<Img>`, no `staticFile`,
+just your chosen technique (shapes, typography, paths, charts, etc.).
 
 ## Packages installed
 

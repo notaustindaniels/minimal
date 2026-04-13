@@ -118,19 +118,55 @@ shot's "what if".>
 
 ## Image fetching
 
-<If the visual direction calls for real photography, include exactly
-this block. Otherwise omit the section entirely.>
+**At least half of the content shots in any video must include an
+Image fetching block.** Real photography is the single biggest lever
+for visual diversity — err toward photo-forward shots unless the
+concept is fundamentally typographic, data-viz, or abstract. A
+"hovering." single-word shot may not need a photo, but a shot about a
+hummingbird's anatomy, flight mechanics, or habitat almost certainly
+should lean on a Pexels photo. Err on the side of including a photo
+request when in doubt.
 
-Run this Bash command to fetch your hero image:
+For shots that include this block, write exactly:
 
 ```bash
 python tools/fetch_image.py "<Pexels-optimized search query>" public/assets/shot{NN}_hero.jpg
 ```
 
-The script writes `public/assets/shot{NN}_hero.jpg` plus a sidecar at
-`public/assets/shot{NN}_hero.jpg.json` containing the subject bounding
-box (absolute and normalized) so you can position overlay typography
-in real negative space. Read the sidecar. Respect the bbox.
+The harness pre-runs this command in Python BEFORE Phase B starts, so
+shot agents see the image and its saliency sidecar already on disk.
+Shot agents do NOT run fetch_image.py themselves.
+
+The saliency sidecar at `public/assets/shot{NN}_hero.jpg.json` will
+contain `subject_bbox_normalized = {x, y, w, h}` in 0..1 so the shot
+agent can position overlay typography in real negative space.
+
+### Query quality is load-bearing
+
+Your Pexels query determines the image the shot agent gets. Be
+specific. Prefer concrete nouns + modifiers + action verbs. The
+harness enforces that every prefetched image must actually be
+imported by the downstream shot component — if the query returns an
+irrelevant photo, the shot agent will struggle to use it and the
+photo-usage validation will respawn the shot. So spend a line of
+thought on the query per shot.
+
+Good: `"ruby-throated hummingbird mid-flight wings blurred iridescent feathers close-up"`
+Good: `"macro photograph of flower stamen pollen grains nectar"`
+Bad:  `"hummingbird"` (too generic — Pexels will return something random)
+Bad:  `"beautiful nature"` (too abstract)
+
+### Photo-usage validation (what the harness enforces)
+
+The harness runs a post-Phase-B test: every brief that contains an
+Image fetching block MUST result in a Shot{NN}.tsx that imports the
+file via `staticFile("assets/...")`. Shots that fail are respawned
+with a mandatory "USE THE PHOTO" directive. The PE cannot "hedge" by
+requesting a photo and then writing a code-only visual direction — if
+you request the image, commit to it in the visual direction text too.
+Describe the photo's role: "use the photo as a full-bleed background
+with a Ken Burns push from 1.0 to 1.15", not "consider using the
+photo".
 
 ## Inspiration
 

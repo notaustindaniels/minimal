@@ -570,6 +570,100 @@ def _splice_authoritative_timing_into_brief(
     brief_path.write_text(new_body)
 
 
+def _parse_fetch_commands_from_brief(brief_path: Path) -> list[tuple[str, Path]]:
+    """
+    Scan a per-shot brief for `python tools/fetch_image.py "<query>" <path>`
+    lines and return a list of (query, out_path_absolute) tuples. Handles
+    both single- and double-quoted queries and allows an optional
+    `--orientation ...` suffix (ignored here; we always fetch landscape).
+    """
+    import re
+    import shlex
+
+    if not brief_path.exists():
+        return []
+
+    out: list[tuple[str, Path]] = []
+    pattern = re.compile(
+        r'python\s+tools/fetch_image\.py\s+(?:"([^"]+)"|\'([^\']+)\')\s+(\S+)'
+    )
+    for line in brief_path.read_text().splitlines():
+        stripped = line.strip()
+        # Allow fenced/bulleted formats by stripping leading markdown chrome.
+        stripped = stripped.lstrip("`-*> ").rstrip("`")
+        m = pattern.search(stripped)
+        if m:
+            query = m.group(1) or m.group(2) or ""
+            rel_path = m.group(3)
+            # Strip trailing quote if present (shlex fallback for edge cases).
+            rel_path = rel_path.rstrip('`"\'')
+            abs_path = (brief_path.parent.parent / rel_path).resolve()
+            if query and rel_path:
+                out.append((query, abs_path))
+    return out
+
+
+def _prefetch_images_from_briefs(project_dir: Path) -> int:
+    """
+    Walk every shot_instructions/Shot{NN}.md brief, extract any
+    `python tools/fetch_image.py "query" path` command, and run the
+    fetch directly in-process (no sandbox, no agent). Writes the image
+    and its saliency sidecar to public/assets/ BEFORE Phase B starts.
+
+    Shot agents then see the image already on disk and don't need to
+    run fetch_image.py themselves. This is the durable fix for the
+    fetch-before-write sequencing bug: agents can't write a component
+    referencing a nonexistent image because the image is there first.
+
+    Returns the number of images successfully fetched.
+    """
+    import importlib.util
+
+    tool_path = project_dir / "tools" / "fetch_image.py"
+    if not tool_path.exists():
+        print("[prefetch] tools/fetch_image.py not found — skipping")
+        return 0
+
+    # Load the fetch_image module in-process (avoids subprocess + sandbox).
+    spec = importlib.util.spec_from_file_location("_fetch_image", tool_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    brief_dir = project_dir / "shot_instructions"
+    briefs = sorted(brief_dir.glob("Shot*.md")) if brief_dir.exists() else []
+
+    print("\n" + "=" * 70)
+    print("  PREFETCH — Pexels images for each shot's brief")
+    print("=" * 70 + "\n")
+
+    count = 0
+    for brief_path in briefs:
+        cmds = _parse_fetch_commands_from_brief(brief_path)
+        for query, abs_path in cmds:
+            print(f"[prefetch] {brief_path.stem}: fetching {query!r} -> {abs_path.name}")
+            try:
+                # Run fetch_image's fetch_image() function directly. It
+                # handles Pexels → Pixabay → Wikipedia + saliency and
+                # writes both the image and the sidecar JSON.
+                mod.fetch_image(
+                    query=query,
+                    out_path=abs_path,
+                    orientation="landscape",
+                    compute_saliency=True,
+                )
+                count += 1
+            except SystemExit as e:
+                print(f"[prefetch]   failed (exit {e.code}) — shot will render without photo")
+            except Exception as e:
+                print(f"[prefetch]   error: {e} — shot will render without photo")
+
+    if count:
+        print(f"[prefetch] fetched {count} image(s) with saliency sidecars")
+    else:
+        print("[prefetch] no image fetch commands found in any brief")
+    return count
+
+
 async def run_phase_prompt_engineer(project_dir: Path, model: str) -> None:
     """
     Phase PE — Translation Prompt Engineer.
@@ -844,6 +938,211 @@ async def run_shot_patch(
         print(f"[phase C] patch agent for {shot_id} did not return cleanly")
 
 
+def _find_photo_delinquents(project_dir: Path) -> list[tuple[str, Path]]:
+    """
+    For every shot whose brief contained a `python tools/fetch_image.py`
+    command (and whose resulting file actually exists on disk after the
+    prefetch step), verify the shot's .tsx component imports that file
+    via a `staticFile("assets/...")` reference.
+
+    Returns a list of (shot_id, expected_asset_path) for shots that
+    failed the check. These need to be re-run with a photo-usage
+    enforcement directive.
+    """
+    import re
+
+    brief_dir = project_dir / "shot_instructions"
+    if not brief_dir.exists():
+        return []
+
+    delinquents: list[tuple[str, Path]] = []
+    for brief_path in sorted(brief_dir.glob("Shot*.md")):
+        # shot id derives from the filename: Shot04.md → shot04
+        suffix = brief_path.stem.replace("Shot", "")
+        try:
+            n = int(suffix)
+        except ValueError:
+            continue
+        shot_id = f"shot{n:02d}"
+
+        cmds = _parse_fetch_commands_from_brief(brief_path)
+        if not cmds:
+            continue
+
+        for _query, abs_path in cmds:
+            # Only enforce if the prefetch actually produced the file.
+            if not abs_path.exists():
+                continue
+
+            # Relative path the component should reference: "assets/NAME.jpg"
+            # Resolve both sides to handle /tmp <-> /private/tmp symlinks on macOS.
+            try:
+                rel_from_public = abs_path.resolve().relative_to(
+                    (project_dir / "public").resolve()
+                )
+            except ValueError:
+                # Asset isn't under project_dir/public — skip
+                continue
+            expected_ref = f"assets/{rel_from_public.name}"
+
+            shot_tsx = project_dir / "src" / "shots" / f"Shot{n:02d}.tsx"
+            if not shot_tsx.exists():
+                delinquents.append((shot_id, abs_path))
+                break
+
+            content = shot_tsx.read_text()
+            # Check for `staticFile("assets/<name>")` or similar.
+            if re.search(
+                rf'staticFile\(\s*["\']{re.escape(expected_ref)}["\']\s*\)',
+                content,
+            ):
+                continue  # OK — component does reference the image
+            delinquents.append((shot_id, abs_path))
+            break  # one complaint per shot is enough
+    return delinquents
+
+
+async def _run_shot_photo_reroll(
+    project_dir: Path,
+    model: str,
+    shot_id: str,
+    expected_asset: Path,
+    semaphore: asyncio.Semaphore,
+) -> None:
+    """
+    Re-run one shot agent with an appended "USE THE PHOTO" directive.
+    The photo and its saliency sidecar are guaranteed to exist on disk
+    at this point.
+    """
+    suffix = _shot_suffix(shot_id)
+    rel_ref = f"assets/{expected_asset.name}"
+    sidecar = expected_asset.with_suffix(expected_asset.suffix + ".json")
+
+    allowed_writes = [
+        f"Write(src/shots/Shot{suffix}.tsx)",
+        f"Edit(src/shots/Shot{suffix}.tsx)",
+        f"Write(src/shots/Shot{suffix}.anchors.json)",
+        f"Edit(src/shots/Shot{suffix}.anchors.json)",
+    ]
+
+    brief_path = project_dir / "shot_instructions" / f"Shot{suffix}.md"
+    brief_text = brief_path.read_text() if brief_path.exists() else ""
+
+    sidecar_note = ""
+    if sidecar.exists():
+        sidecar_note = (
+            f"\n\nThe saliency sidecar at `public/{rel_ref}.json` has the "
+            "subject bounding box — read it and position any overlay "
+            "typography OUTSIDE `subject_bbox_normalized`.\n"
+        )
+
+    enforcement = (
+        "\n\n## PHOTO USAGE ENFORCEMENT (mandatory rerun)\n\n"
+        f"Your previous version of this shot did NOT import the photo "
+        f"that your brief instructed. The file exists at "
+        f"`public/{rel_ref}`. You must import and render it this rerun "
+        f"as the primary visual element:\n\n"
+        "```tsx\n"
+        "import { AbsoluteFill, Img, staticFile, interpolate, useCurrentFrame } from \"remotion\";\n"
+        "\n"
+        "const Shot" + suffix + " = () => {\n"
+        "  const frame = useCurrentFrame();\n"
+        "  const scale = interpolate(frame, [0, durationFrames], [1.0, 1.15]);\n"
+        "  return (\n"
+        "    <AbsoluteFill>\n"
+        f"      <Img src={{staticFile(\"{rel_ref}\")}}\n"
+        "           style={{ width: \"100%\", height: \"100%\", objectFit: \"cover\",\n"
+        "                    transform: `scale(${scale})` }} />\n"
+        "      {/* overlay typography pinned to negative space per saliency sidecar */}\n"
+        "    </AbsoluteFill>\n"
+        "  );\n"
+        "};\n"
+        "```\n"
+        f"{sidecar_note}"
+        "Do NOT write a code-only shot. The photo must be visible."
+    )
+
+    async with semaphore:
+        client = _build_client(
+            project_dir=project_dir,
+            model=model,
+            system_prompt=(
+                f"You are the shot agent for {shot_id}, re-running because "
+                "your previous version did not import the required photo. "
+                "Import it this time. Use it as the primary visual element."
+            ),
+            allowed_writes=allowed_writes,
+        )
+        prompt = (
+            _load_prompt("shot_prompt.md")
+            + f"\n\n## SHOT_ID\n\n{shot_id}\n"
+            + f"\n\n## SHOT_INSTRUCTIONS\n\n{brief_text}\n"
+            + enforcement
+        )
+        async with client:
+            await run_agent_session(client, prompt, project_dir)
+
+
+async def run_photo_usage_pass(
+    project_dir: Path,
+    model: str,
+    max_rerolls: int = 2,
+) -> None:
+    """
+    Hardcoded Python test that runs after Phase B: every prefetched
+    image declared in a brief must be imported by the corresponding
+    Shot{NN}.tsx via `staticFile("assets/...")`. Shots that fail the
+    check are respawned with an explicit "USE THE PHOTO" directive.
+
+    This is the durable fix for "the shot agent fetches but doesn't
+    use the photo". The PE's intent is load-bearing, and so is the
+    downstream shot agent's execution of that intent.
+    """
+    print("\n" + "=" * 70)
+    print("  PHOTO USAGE ENFORCEMENT")
+    print("=" * 70 + "\n")
+
+    semaphore = asyncio.Semaphore(5)
+    for attempt in range(1, max_rerolls + 2):  # +1 so initial check is attempt 1
+        delinquents = _find_photo_delinquents(project_dir)
+        if not delinquents:
+            if attempt == 1:
+                print("[photo-usage] all briefs with images are honored — skipping")
+            else:
+                print(f"[photo-usage] clean after {attempt - 1} reroll(s)")
+            return
+
+        if attempt > max_rerolls:
+            print(
+                f"[photo-usage] WARNING: {len(delinquents)} shot(s) still "
+                f"not using their photos after {max_rerolls} reroll(s): "
+                f"{[d[0] for d in delinquents]} — proceeding to Phase C anyway"
+            )
+            return
+
+        print(
+            f"[photo-usage] attempt {attempt}: {len(delinquents)} shot(s) "
+            f"not using their photos: {[d[0] for d in delinquents]}"
+        )
+        await asyncio.gather(
+            *(
+                _run_shot_photo_reroll(project_dir, model, sid, path, semaphore)
+                for sid, path in delinquents
+            ),
+            return_exceptions=True,
+        )
+        # After rerolling, re-stitch anchors + re-run alignment (the rerolls
+        # may have shifted anchor placement).
+        n_anchors = stitch_anchors(project_dir)
+        print(f"[photo-usage] re-stitched {n_anchors} anchors after reroll")
+        result = run_alignment_test(project_dir)
+        print(f"[photo-usage] post-reroll alignment: {result.summary()}")
+        if not result.passed:
+            raise RuntimeError(
+                f"Photo-usage reroll broke alignment: {result.failures}"
+            )
+
+
 async def run_phase_c(project_dir: Path, model: str, max_render_retries: int = 3) -> None:
     """
     Compositor: writes Root.tsx, runs alignment test, renders.
@@ -949,12 +1248,21 @@ async def main_async(args: argparse.Namespace) -> None:
     # writes shot_instructions/Shot{NN}.md for each shot.
     await run_phase_prompt_engineer(project_dir, args.model)
 
+    # Prefetch: harness runs every `python tools/fetch_image.py` command
+    # referenced by any brief BEFORE Phase B starts, so shot agents see
+    # their photos already on disk (no sandbox retry, no sequencing bug).
+    _prefetch_images_from_briefs(project_dir)
+
     # Phase B: parallel shot agents. Each reads its custom brief
-    # appended to shot_prompt.md. On-demand Pexels fetches via
-    # tools/fetch_image.py. No central catalog → no adjacent-collision
-    # coordination needed (the PE prescribes different techniques
-    # per adjacent shot up-front).
+    # appended to shot_prompt.md. Images are already on disk from the
+    # prefetch. Agents compose around pre-computed saliency bboxes.
     await run_phase_b(project_dir, args.model, max_retries=args.max_scene_retries)
+
+    # Photo-usage enforcement: any shot whose brief referenced a
+    # prefetched image MUST actually import it. If not, the harness
+    # respawns the shot agent with a "USE THE PHOTO" directive. Loops
+    # until clean.
+    await run_photo_usage_pass(project_dir, args.model)
 
     # Phase C: compositor → render (with patch retry on render failure)
     await run_phase_c(project_dir, args.model)

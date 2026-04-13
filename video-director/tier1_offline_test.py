@@ -155,6 +155,52 @@ def main() -> None:
     assert "anchor.beat" in out and "absolute frame 30" in out and "local frame 30" in out
     print(f"[tier1]   get_shot_timing output length: {len(out)} chars")
 
+    # Unit test: _parse_fetch_commands_from_brief extracts python calls.
+    print("[tier1] _parse_fetch_commands_from_brief smoke")
+    brief_dir = PROJECT / "shot_instructions"
+    brief_dir.mkdir(parents=True, exist_ok=True)
+    (brief_dir / "Shot02.md").write_text(
+        '# Shot02 — Brief\n\n'
+        '## Image fetching\n\n'
+        'Run this Bash command to fetch your hero image:\n\n'
+        '```bash\n'
+        'python tools/fetch_image.py "ruby-throated hummingbird hovering mid-flight" public/assets/shot02_hero.jpg\n'
+        '```\n\n'
+        '## Visual direction\n\nSomething bold.\n'
+    )
+    parsed = director_mod._parse_fetch_commands_from_brief(brief_dir / "Shot02.md")
+    assert len(parsed) == 1, f"expected 1 fetch command, got {len(parsed)}"
+    q, p = parsed[0]
+    assert q == "ruby-throated hummingbird hovering mid-flight"
+    assert p.name == "shot02_hero.jpg"
+    print(f"[tier1]   parsed: query={q!r}, path={p.name}")
+
+    # Unit test: _find_photo_delinquents flags shots with a declared
+    # image in their brief that are missing staticFile() references.
+    print("[tier1] _find_photo_delinquents smoke")
+    (PROJECT / "public" / "assets").mkdir(parents=True, exist_ok=True)
+    (PROJECT / "public" / "assets" / "shot02_hero.jpg").write_bytes(b"fake")
+
+    # Shot02.tsx WITHOUT a staticFile reference → should be flagged
+    (PROJECT / "src" / "shots" / "Shot02.tsx").write_text(
+        "export const Shot02: React.FC = () => <div>no photo used</div>;\n"
+    )
+    delinquents = director_mod._find_photo_delinquents(PROJECT)
+    assert any(d[0] == "shot02" for d in delinquents), \
+        f"shot02 should be flagged as delinquent, got {delinquents}"
+    print("[tier1]   shot02 correctly flagged as delinquent")
+
+    # Now rewrite Shot02.tsx WITH a staticFile reference → should pass
+    (PROJECT / "src" / "shots" / "Shot02.tsx").write_text(
+        'import { staticFile } from "remotion";\n'
+        'export const Shot02: React.FC = () => '
+        '<img src={staticFile("assets/shot02_hero.jpg")} />;\n'
+    )
+    delinquents = director_mod._find_photo_delinquents(PROJECT)
+    assert not any(d[0] == "shot02" for d in delinquents), \
+        f"shot02 should NOT be flagged now, got {delinquents}"
+    print("[tier1]   shot02 correctly passes after adding staticFile reference")
+
     # Unit test: _splice_authoritative_timing_into_brief replaces any
     # PE-written timing sections with the canonical block.
     print("[tier1] _splice_authoritative_timing_into_brief smoke")
