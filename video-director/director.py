@@ -225,61 +225,6 @@ export function resolveAnchor(id: string): number | null {
 }
 """
 
-CAPTIONS_TSX = """// Auto-generated caption overlay. Reads timing.json captions and renders
-// the active caption for the current frame. Mounted at the Root level by
-// the compositor — shot components do NOT render captions themselves.
-import React from "react";
-import { useCurrentFrame } from "remotion";
-import timing from "../timing.json";
-
-interface Caption {
-  text: string;
-  start_frame: number;
-  end_frame: number;
-}
-
-export const Captions: React.FC = () => {
-  const frame = useCurrentFrame();
-  const captions = (timing as { captions?: Caption[] }).captions ?? [];
-  const active = captions.find(
-    (c) => frame >= c.start_frame && frame < c.end_frame
-  );
-  if (!active) return null;
-  return (
-    <div
-      style={{
-        position: "absolute",
-        bottom: 96,
-        left: 0,
-        right: 0,
-        textAlign: "center",
-        pointerEvents: "none",
-      }}
-    >
-      <span
-        style={{
-          display: "inline-block",
-          padding: "12px 24px",
-          background: "rgba(0,0,0,0.55)",
-          color: "white",
-          fontFamily:
-            "system-ui, -apple-system, 'Segoe UI', sans-serif",
-          fontSize: 44,
-          fontWeight: 600,
-          lineHeight: 1.2,
-          borderRadius: 8,
-          maxWidth: "80%",
-          whiteSpace: "pre-wrap",
-        }}
-      >
-        {active.text}
-      </span>
-    </div>
-  );
-};
-"""
-
-
 def scaffold_project(project_dir: Path, spec_path: Path, install: bool = True) -> None:
     """Copy the video spec in, write the Remotion skeleton, and pnpm install."""
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -299,7 +244,6 @@ def scaffold_project(project_dir: Path, spec_path: Path, install: bool = True) -
     (project_dir / "src" / "anchors.ts").write_text(ANCHORS_STUB)
     (project_dir / "src" / "index.ts").write_text(REMOTION_INDEX_TS)
     (project_dir / "src" / "Root.tsx").write_text(ROOT_STUB)
-    (project_dir / "src" / "Captions.tsx").write_text(CAPTIONS_TSX)
     print(f"[scaffold] Remotion skeleton written to {project_dir}")
 
     if install:
