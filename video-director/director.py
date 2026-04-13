@@ -168,6 +168,11 @@ REMOTION_PACKAGE_JSON = {
         "remotion": "^4.0.0",
         "@remotion/cli": "^4.0.0",
         "@remotion/bundler": "^4.0.0",
+        # Minimal visual toolkit — required by the composition catalog
+        # in prompts/shot_prompt.md (shapes for primitives, google-fonts
+        # for the full_bleed_headline layout and typographic heroes).
+        "@remotion/shapes": "^4.0.0",
+        "@remotion/google-fonts": "^4.0.0",
     },
     "devDependencies": {
         "typescript": "^5.4.0",
@@ -427,6 +432,147 @@ async def run_phase_b_shot(
         return status, response
 
 
+def _fetch_wikipedia_image(term: str, out_dir: Path) -> dict | None:
+    """
+    Fetch the main image for a Wikipedia-searchable term via the
+    MediaWiki action API. Returns an asset descriptor dict or None if
+    no image is available.
+
+    No API key required, no third-party dependencies — just urllib.
+    """
+    import urllib.parse
+    import urllib.request
+    import re
+
+    api_url = (
+        "https://en.wikipedia.org/w/api.php?"
+        "action=query&format=json&prop=pageimages&piprop=thumbnail%7Coriginal"
+        "&pithumbsize=1920&redirects=1&titles="
+        + urllib.parse.quote(term)
+    )
+    try:
+        req = urllib.request.Request(
+            api_url,
+            headers={"User-Agent": "video-director/1.0 (https://github.com/notaustindaniels/minimal)"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"[assets]   API error for '{term}': {e}")
+        return None
+
+    pages = (data.get("query") or {}).get("pages") or {}
+    for page_id, page in pages.items():
+        if str(page_id) == "-1":
+            continue
+        thumb = page.get("thumbnail") or page.get("original")
+        if not thumb or not thumb.get("source"):
+            continue
+        img_url = thumb["source"]
+
+        safe_name = re.sub(r"[^a-z0-9]+", "_", term.lower()).strip("_")[:40] or "asset"
+        ext = Path(urllib.parse.urlparse(img_url).path).suffix.lower() or ".jpg"
+        if ext not in (".jpg", ".jpeg", ".png", ".webp"):
+            ext = ".jpg"
+        out_file = out_dir / f"{safe_name}{ext}"
+
+        try:
+            req2 = urllib.request.Request(
+                img_url,
+                headers={"User-Agent": "video-director/1.0"},
+            )
+            with urllib.request.urlopen(req2, timeout=30) as resp:
+                out_file.write_bytes(resp.read())
+        except Exception as e:
+            print(f"[assets]   download error for '{term}': {e}")
+            return None
+
+        return {
+            "filename": f"assets/{out_file.name}",
+            "wikipedia_title": page.get("title", term),
+            "search_term": term,
+            "dimensions": f"{thumb.get('width')}x{thumb.get('height')}",
+            "source_url": img_url,
+        }
+    return None
+
+
+async def run_phase_assets(project_dir: Path, model: str) -> None:
+    """
+    Asset scout agent picks Wikipedia-searchable terms; Python then
+    downloads the images from the Wikipedia API. Produces assets.json
+    at the project root.
+
+    Failures here are non-fatal — we write an empty assets.json and
+    let Phase B fall back to shape/typography layouts.
+    """
+    print("\n" + "=" * 70)
+    print("  PHASE ASSETS — Wikipedia image fetcher")
+    print("=" * 70 + "\n")
+
+    assets_path = project_dir / "assets.json"
+    terms_path = project_dir / "asset_search_terms.json"
+
+    client = _build_client(
+        project_dir=project_dir,
+        model=model,
+        system_prompt=(
+            "You are an asset scout. Read script.json and video_spec.xml, "
+            "then write asset_search_terms.json with 5-10 Wikipedia-searchable "
+            "terms. Nothing else."
+        ),
+        allowed_writes=[
+            "Write(asset_search_terms.json)",
+            "Edit(asset_search_terms.json)",
+        ],
+    )
+    prompt = _load_prompt("asset_fetcher_prompt.md")
+    try:
+        async with client:
+            status, _ = await run_agent_session(client, prompt, project_dir)
+    except Exception as e:
+        print(f"[assets] scout agent raised: {e} — skipping asset fetch")
+        assets_path.write_text("[]")
+        return
+
+    if status != "continue" or not terms_path.exists():
+        print("[assets] scout did not produce asset_search_terms.json — skipping")
+        assets_path.write_text("[]")
+        return
+
+    try:
+        terms = json.loads(terms_path.read_text())
+    except Exception as e:
+        print(f"[assets] asset_search_terms.json is malformed ({e}) — skipping")
+        assets_path.write_text("[]")
+        return
+
+    assets_dir = project_dir / "public" / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    downloaded: list[dict] = []
+    for item in terms:
+        if isinstance(item, dict):
+            term = item.get("term") or ""
+            reason = item.get("reason") or ""
+        else:
+            term = str(item)
+            reason = ""
+        if not term:
+            continue
+        print(f"[assets] fetching '{term}' from Wikipedia")
+        result = _fetch_wikipedia_image(term, assets_dir)
+        if result:
+            result["reason"] = reason
+            downloaded.append(result)
+            print(f"[assets]   got {result['filename']} ({result['dimensions']})")
+        else:
+            print(f"[assets]   no image found for '{term}'")
+
+    assets_path.write_text(json.dumps(downloaded, indent=2))
+    print(f"[assets] wrote {len(downloaded)}/{len(terms)} asset entries to assets.json")
+
+
 async def run_phase_b(
     project_dir: Path,
     model: str,
@@ -560,10 +706,13 @@ async def main_async(args: argparse.Namespace) -> None:
 
     scaffold_project(project_dir, spec_path)
 
-    # Phase A: director agent → script.json (continuous narration + shots)
+    # Phase A: director agent → script.json (continuous narration + phrases)
     await run_phase_a(project_dir, args.model)
 
-    # Driver: TTS → audio.mp3 + timing.json (anchors + shot frames + captions)
+    # Phase Assets: scout agent + Wikipedia downloader → assets.json
+    await run_phase_assets(project_dir, args.model)
+
+    # Driver: TTS → audio.mp3 + timing.json (anchors + shot frames)
     script = load_script(project_dir / "script.json")
     synthesize_script(script, project_dir, fps=args.fps)
 
