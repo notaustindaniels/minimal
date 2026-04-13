@@ -230,6 +230,63 @@ export function resolveAnchor(id: string): number | null {
 }
 """
 
+REMOTION_SKILL_DIR = (
+    Path.home() / ".claude" / "skills" / "remotion-best-practices" / "rules"
+)
+
+
+def _copy_remotion_skill(project_dir: Path) -> int:
+    """
+    Copy the FULL remotion-best-practices rule set into
+    project_dir/docs/remotion-rules/. Shot agents have Read scoped to
+    project_dir only, so the link in shot_prompt.md would be broken
+    without this.
+
+    Also generates an INDEX.md so agents can survey the catalog without
+    a full glob.
+    """
+    dest = project_dir / "docs" / "remotion-rules"
+    dest.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    rule_names: list[str] = []
+    if REMOTION_SKILL_DIR.exists():
+        for src in sorted(REMOTION_SKILL_DIR.glob("*.md")):
+            shutil.copy(src, dest / src.name)
+            copied += 1
+            rule_names.append(src.name)
+        # Copy the assets subdirectory too (tsx recipes).
+        assets_src = REMOTION_SKILL_DIR / "assets"
+        if assets_src.exists():
+            assets_dest = dest / "assets"
+            assets_dest.mkdir(exist_ok=True)
+            for src in assets_src.iterdir():
+                if src.is_file():
+                    shutil.copy(src, assets_dest / src.name)
+
+    # Write an index so agents can see the catalog.
+    index_lines = [
+        "# Remotion technique rules — FULL catalog",
+        "",
+        "This directory holds every rule from the remotion-best-practices",
+        "skill. Open any file that matches your shot's ambition. Prefer",
+        "high-level techniques over hand-rolled SVG.",
+        "",
+    ]
+    for name in rule_names:
+        index_lines.append(f"- `{name}`")
+    (dest / "INDEX.md").write_text("\n".join(index_lines) + "\n")
+    return copied
+
+
+def _copy_design_skill(project_dir: Path) -> None:
+    """Copy prompts/remotion_design_skill.md → project_dir/docs/remotion-design-skill.md"""
+    src = PHASE_PROMPTS / "remotion_design_skill.md"
+    if src.exists():
+        dest = project_dir / "docs" / "remotion-design-skill.md"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src, dest)
+
+
 def scaffold_project(project_dir: Path, spec_path: Path, install: bool = True) -> None:
     """Copy the video spec in, write the Remotion skeleton, and pnpm install."""
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -249,7 +306,12 @@ def scaffold_project(project_dir: Path, spec_path: Path, install: bool = True) -
     (project_dir / "src" / "anchors.ts").write_text(ANCHORS_STUB)
     (project_dir / "src" / "index.ts").write_text(REMOTION_INDEX_TS)
     (project_dir / "src" / "Root.tsx").write_text(ROOT_STUB)
-    print(f"[scaffold] Remotion skeleton written to {project_dir}")
+
+    n_rules = _copy_remotion_skill(project_dir)
+    _copy_design_skill(project_dir)
+    print(
+        f"[scaffold] Remotion skeleton + {n_rules} remotion-best-practices rules + design skill written to {project_dir}"
+    )
 
     if install:
         import subprocess
@@ -639,8 +701,106 @@ async def run_phase_b(
     )
 
 
-async def run_phase_c(project_dir: Path, model: str) -> None:
-    """Compositor: writes Root.tsx, runs alignment test, renders."""
+def _extract_broken_shots_from_text(text: str) -> list[str]:
+    """
+    Find references like 'Shot08.tsx' or 'shot08' or 'shots/Shot08' in
+    error output. Returns a sorted unique list of shot ids
+    (e.g. ['shot08']).
+    """
+    import re
+
+    found: set[str] = set()
+    # Match Shot<digits>.tsx
+    for m in re.finditer(r"Shot0*(\d+)\.tsx", text):
+        n = int(m.group(1))
+        found.add(f"shot{n:02d}")
+    # Match path-style references: src/shots/Shot08
+    for m in re.finditer(r"shots/Shot0*(\d+)", text):
+        n = int(m.group(1))
+        found.add(f"shot{n:02d}")
+    return sorted(found)
+
+
+def _python_render(project_dir: Path) -> tuple[bool, str]:
+    """
+    Run `pnpm exec remotion render` directly via subprocess. Returns
+    (success, captured_output). Used by the Phase C retry loop after a
+    minimal-patch agent has fixed a broken shot — we don't need a fresh
+    compositor agent to redo Root.tsx, just to retry the render.
+    """
+    import subprocess
+
+    print("[phase C] retrying render via direct subprocess")
+    out_path = project_dir / "out" / "video.mp4"
+    proc = subprocess.run(
+        [
+            "pnpm",
+            "exec",
+            "remotion",
+            "render",
+            "src/index.ts",
+            "main",
+            str(out_path),
+        ],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    if proc.returncode == 0 and out_path.exists():
+        return True, output
+    return False, output
+
+
+async def run_shot_patch(
+    project_dir: Path,
+    model: str,
+    shot_id: str,
+    error_excerpt: str,
+) -> None:
+    """
+    Spawn a fresh Claude scoped to Edit a single shot file with a
+    minimal patch. The patch agent reads the error message and the
+    shot file, makes the smallest possible edit, and stops.
+    """
+    suffix = _shot_suffix(shot_id)
+    print(f"[phase C] spawning patch agent for {shot_id}")
+
+    client = _build_client(
+        project_dir=project_dir,
+        model=model,
+        system_prompt=(
+            f"You are a minimal-patch agent for {shot_id}. "
+            "Read the error, read the shot file, make the smallest "
+            "possible edit. Preserve the visual concept."
+        ),
+        allowed_writes=[
+            f"Edit(src/shots/Shot{suffix}.tsx)",
+        ],
+    )
+    base_prompt = _load_prompt("shot_patch_prompt.md")
+    # Trim error excerpt to the most relevant ~3000 chars so the prompt
+    # doesn't balloon.
+    excerpt = error_excerpt[-3000:] if len(error_excerpt) > 3000 else error_excerpt
+    prompt = (
+        base_prompt
+        + f"\n\n## SHOT_ID\n\n{shot_id}\n\n## ERROR_EXCERPT\n\n```\n{excerpt}\n```\n"
+    )
+    async with client:
+        status, _ = await run_agent_session(client, prompt, project_dir)
+    if status != "continue":
+        print(f"[phase C] patch agent for {shot_id} did not return cleanly")
+
+
+async def run_phase_c(project_dir: Path, model: str, max_render_retries: int = 3) -> None:
+    """
+    Compositor: writes Root.tsx, runs alignment test, renders.
+
+    On render failure, parses the captured output for broken shot
+    files, spawns a minimal-patch agent for each, then retries the
+    render directly via subprocess (no full compositor re-run).
+    """
     print("\n" + "=" * 70)
     print("  PHASE C — Compositor")
     print("=" * 70 + "\n")
@@ -649,23 +809,44 @@ async def run_phase_c(project_dir: Path, model: str) -> None:
         project_dir=project_dir,
         model=model,
         system_prompt=(
-            "You are the compositor. Assemble scenes into Root.tsx, "
-            "verify alignment, and render. Never edit scene components."
+            "You are the compositor. Assemble shots into Root.tsx, "
+            "verify alignment, and render. Never edit shot components."
         ),
     )
     prompt = _load_prompt("compositor_prompt.md")
     async with client:
-        status, _ = await run_agent_session(client, prompt, project_dir)
+        status, response = await run_agent_session(client, prompt, project_dir)
     if status != "continue":
         raise RuntimeError("Phase C (compositor) failed")
 
     out_path = project_dir / "out" / "video.mp4"
-    if not out_path.exists():
-        raise RuntimeError(
-            f"Phase C finished without producing {out_path}. "
-            "Check compositor output above."
-        )
-    print(f"\n[done] rendered {out_path}")
+    if out_path.exists():
+        print(f"\n[done] rendered {out_path}")
+        return
+
+    # Compositor finished but no video. Enter the patch + retry loop.
+    last_output = response
+    for attempt in range(1, max_render_retries + 1):
+        broken = _extract_broken_shots_from_text(last_output)
+        if not broken:
+            raise RuntimeError(
+                f"Phase C: render failed and no broken shot files could be "
+                f"identified.\nLast output tail:\n{last_output[-1500:]}"
+            )
+
+        print(f"[phase C] retry {attempt}/{max_render_retries}: broken shots = {broken}")
+        for shot_id in broken:
+            await run_shot_patch(project_dir, model, shot_id, last_output)
+
+        ok, last_output = _python_render(project_dir)
+        if ok:
+            print(f"\n[done] rendered {out_path} (after {attempt} patch retry/retries)")
+            return
+
+    raise RuntimeError(
+        f"Phase C exhausted {max_render_retries} patch retries.\n"
+        f"Last output tail:\n{last_output[-1500:]}"
+    )
 
 
 # ---------------------------------------------------------------------------
