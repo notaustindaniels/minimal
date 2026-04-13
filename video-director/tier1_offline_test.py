@@ -56,6 +56,12 @@ def main() -> None:
     assert (PROJECT / "src" / "shots").exists()
     assert not (PROJECT / "src" / "Captions.tsx").exists(), \
         "Captions.tsx should NOT be scaffolded in the phrase-cut model"
+    # New scaffold files (PE + tools + docs)
+    assert (PROJECT / "tools" / "fetch_image.py").exists(), "fetch_image.py not copied"
+    assert (PROJECT / "tools" / "get_shot_timing.py").exists(), "get_shot_timing.py not copied"
+    assert (PROJECT / "docs" / "showcase-examples.md").exists(), "showcase-examples.md not copied"
+    assert (PROJECT / "docs" / "remotion-design-skill.md").exists(), "remotion-design-skill.md not copied"
+    assert (PROJECT / "shot_instructions").exists(), "shot_instructions dir not created"
 
     # Hand-craft a timing.json that the validator + stitcher can chew on.
     # 3 shots derived from 3 phrases (no captions).
@@ -127,6 +133,49 @@ def main() -> None:
     # Shots are contiguous
     for i in range(len(shots) - 1):
         assert shots[i]["end_frame"] == shots[i + 1]["start_frame"]
+
+    # Unit test: get_shot_timing.py produces the expected block
+    print("[tier1] get_shot_timing.py smoke")
+    import subprocess
+    proc = subprocess.run(
+        ["python", "tools/get_shot_timing.py", "shot01"],
+        cwd=PROJECT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"get_shot_timing failed: {proc.stderr}"
+    out = proc.stdout
+    assert "## The phrase" in out
+    assert "## Frame window" in out
+    assert "## Anchor contract" in out
+    assert "start_frame: 0" in out
+    assert "end_frame: 60" in out
+    assert "fps: 30" in out
+    # shot01 owns anchor.beat (frame 30)
+    assert "anchor.beat" in out and "absolute frame 30" in out and "local frame 30" in out
+    print(f"[tier1]   get_shot_timing output length: {len(out)} chars")
+
+    # Unit test: _splice_authoritative_timing_into_brief replaces any
+    # PE-written timing sections with the canonical block.
+    print("[tier1] _splice_authoritative_timing_into_brief smoke")
+    brief_dir = PROJECT / "shot_instructions"
+    brief_dir.mkdir(parents=True, exist_ok=True)
+    # Write a brief with WRONG timing info (PE hallucinated)
+    (brief_dir / "Shot01.md").write_text(
+        "# Shot01 — Brief\n\n"
+        "## The phrase\n\n> \"WRONG TEXT\"\n\n"
+        "## Frame window\n\n- start_frame: 9999\n- end_frame: 9999\n\n"
+        "## Anchor contract\n\nwrong\n\n"
+        "## Visual direction\n\nA bold visual concept.\n"
+    )
+    director_mod._splice_authoritative_timing_into_brief(PROJECT, "shot01")
+    spliced = (brief_dir / "Shot01.md").read_text()
+    assert "9999" not in spliced, "spliced brief still has hallucinated frame numbers"
+    assert "start_frame: 0" in spliced
+    assert "end_frame: 60" in spliced
+    assert "A bold visual concept." in spliced, "creative direction should be preserved"
+    assert "anchor.beat" in spliced, "anchor contract should be replaced with canonical"
+    print("[tier1]   splice correctly replaced bogus timing")
 
     # Real vitest run against the stitched anchors.
     print("[tier1] running real vitest alignment.test.ts")

@@ -31,6 +31,8 @@ _VIDEO_EXTRA_COMMANDS = {
     "ffprobe",  # inspecting durations, stream metadata
     "find",     # locating generated assets
     "mv",       # moving rendered outputs into place
+    "python",   # shot + PE agents invoke local tools (fetch_image.py, get_shot_timing.py)
+    "python3",  # same, when python3 is the canonical name
 }
 
 _base.ALLOWED_COMMANDS.update(_VIDEO_EXTRA_COMMANDS)

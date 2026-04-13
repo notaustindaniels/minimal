@@ -1,32 +1,29 @@
 """
 video-director — Remotion one-shot harness.
 
-Orchestrates three phases against a video spec:
+Pipeline:
 
-  Phase A  (sequential, 1 agent)
-      Director agent reads video_spec.xml and writes script.json +
-      scene_status.json. The driver then calls ElevenLabs TTS on the
-      script, writing public/audio.wav and timing.json. The driver
-      then generates alignment.test.ts from timing.json.
+  Phase 0  Spec Refactor            (1 agent) brief.md → video_spec.xml
+  Phase A  Director                 (1 agent) video_spec.xml → script.json
+  TTS      ElevenLabs + phrase cut  (code)    script.json → audio.mp3 + timing.json
+  Phase PE Translation Prompt Eng.  (1 agent) everything → shot_instructions/Shot{NN}.md
+  Phase B  Shot agents              (N parallel, max 5 concurrent)
+                                    each reads its own instruction file,
+                                    writes src/shots/Shot{NN}.tsx + anchors
+  Phase C  Compositor               (1 agent + render retry) Root.tsx + mp4
 
-  Phase B  (parallel, N agents — one per scene)
-      Each scene agent writes src/scenes/Scene{N}.tsx and
-      src/scenes/Scene{N}.anchors.json. After all finish, the driver
-      stitches src/anchors.ts from every anchors.json file and runs
-      the alignment test. Failing anchors are mapped back to the
-      scene that owns them and those scenes are re-queued for a
-      fresh agent pass (up to --max-scene-retries).
-
-  Phase C  (sequential, 1 agent)
-      Compositor agent writes src/Root.tsx, runs the alignment test,
-      and renders out/video.mp4 via `npx remotion render`.
+Each shot agent has full access to its own instruction brief from the
+PE, the remotion-best-practices skill in docs/remotion-rules/, and an
+on-demand image fetcher at tools/fetch_image.py (Pexels → Pixabay →
+Wikipedia, with U2-Net small saliency post-processing).
 
 Usage:
     python video-director/director.py \\
-        --spec /tmp/my-video/video_spec.xml \\
+        --brief /tmp/my-video/brief.md \\
         --out /tmp/my-video/project
 
-Requires CLAUDE_CODE_OAUTH_TOKEN and ELEVENLABS_API_KEY in the environment.
+Requires in env: CLAUDE_CODE_OAUTH_TOKEN, ELEVENLABS_API_KEY, PEXELS_API_KEY.
+Optional: ELEVENLABS_VOICE_ID, PIXABAY_API_KEY.
 """
 
 from __future__ import annotations
@@ -287,6 +284,38 @@ def _copy_design_skill(project_dir: Path) -> None:
         shutil.copy(src, dest)
 
 
+def _copy_showcase_examples(project_dir: Path) -> None:
+    """Copy prompts/showcase_examples.md → project_dir/docs/showcase-examples.md.
+
+    This is the scraped remotion.dev/prompts showcase — the PE uses it as
+    a reference library of known-great prompts when writing per-shot briefs.
+    Shot agents do not read it; only the PE does.
+    """
+    src = PHASE_PROMPTS / "showcase_examples.md"
+    if src.exists():
+        dest = project_dir / "docs" / "showcase-examples.md"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src, dest)
+
+
+def _copy_tools(project_dir: Path) -> None:
+    """Copy every script in video-director/tools/ → project_dir/tools/.
+
+    Includes:
+      - fetch_image.py       (Pexels → Pixabay → Wikipedia + U2-Net saliency)
+      - get_shot_timing.py   (authoritative timing block for the PE)
+    """
+    src_dir = _HERE / "tools"
+    if not src_dir.exists():
+        return
+    dest_dir = project_dir / "tools"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for src in src_dir.glob("*.py"):
+        dest = dest_dir / src.name
+        shutil.copy(src, dest)
+        dest.chmod(0o755)
+
+
 def scaffold_project(project_dir: Path, spec_path: Path, install: bool = True) -> None:
     """Copy the video spec in, write the Remotion skeleton, and pnpm install."""
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -309,8 +338,12 @@ def scaffold_project(project_dir: Path, spec_path: Path, install: bool = True) -
 
     n_rules = _copy_remotion_skill(project_dir)
     _copy_design_skill(project_dir)
+    _copy_showcase_examples(project_dir)
+    _copy_tools(project_dir)
+    (project_dir / "shot_instructions").mkdir(parents=True, exist_ok=True)
     print(
-        f"[scaffold] Remotion skeleton + {n_rules} remotion-best-practices rules + design skill written to {project_dir}"
+        f"[scaffold] Remotion skeleton + {n_rules} rules + design skill + "
+        f"showcase + fetch_image.py written to {project_dir}"
     )
 
     if install:
@@ -460,192 +493,147 @@ def _shot_suffix(shot_id: str) -> str:
     return f"{int(n):02d}"
 
 
-def _extract_assets_from_shot_file(project_dir: Path, shot_id: str) -> set[str]:
-    """Scan a shot's .tsx for staticFile('assets/...') references."""
+def _authoritative_timing_block(project_dir: Path, shot_id: str) -> str:
+    """
+    Run tools/get_shot_timing.py via in-process import and return its
+    output. This is the single source of truth for phrase text, frame
+    window, and anchor contract. Shot agents never see anything else.
+    """
+    import importlib.util
+
+    tool_path = project_dir / "tools" / "get_shot_timing.py"
+    if not tool_path.exists():
+        raise RuntimeError(f"get_shot_timing.py not scaffolded at {tool_path}")
+
+    # Load the scaffold-copied script as a module and call its
+    # render_timing_block() directly (avoids spawning a subprocess).
+    spec = importlib.util.spec_from_file_location("_get_shot_timing", tool_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.render_timing_block(project_dir, shot_id)
+
+
+def _splice_authoritative_timing_into_brief(
+    project_dir: Path, shot_id: str
+) -> None:
+    """
+    Guarantee the per-shot brief starts with the authoritative timing
+    block. If the PE wrote its own `## The phrase` / `## Frame window` /
+    `## Anchor contract` sections, replace them with the canonical
+    output of get_shot_timing.py. If it didn't, prepend the canonical
+    block.
+
+    This is the belt-and-suspenders for the one hard rule: frame marks
+    cannot miss.
+    """
     import re
 
     suffix = _shot_suffix(shot_id)
-    path = project_dir / "src" / "shots" / f"Shot{suffix}.tsx"
-    if not path.exists():
-        return set()
-    content = path.read_text()
-    matches = re.findall(r'staticFile\(["\']assets/([^"\']+)["\']\)', content)
-    return {f"assets/{m}" for m in matches}
+    brief_path = project_dir / "shot_instructions" / f"Shot{suffix}.md"
+    if not brief_path.exists():
+        return
+
+    authoritative = _authoritative_timing_block(project_dir, shot_id).strip() + "\n"
+    body = brief_path.read_text()
+
+    # Strip any existing authoritative sections the PE might have written.
+    # We remove everything from the first `## The phrase`, `## Frame window`,
+    # or `## Anchor contract` heading up until (but not including) the next
+    # heading that is NOT one of those three.
+    authoritative_headings = {"## The phrase", "## Frame window", "## Anchor contract"}
+    lines = body.splitlines()
+    stripped: list[str] = []
+    skipping = False
+    for line in lines:
+        if line.startswith("## ") and line.strip() in authoritative_headings:
+            skipping = True
+            continue
+        if skipping and line.startswith("## ") and line.strip() not in authoritative_headings:
+            skipping = False
+        if not skipping:
+            stripped.append(line)
+
+    stripped_body = "\n".join(stripped).lstrip()
+    # Also drop any leading H1 the PE wrote before we prepend — we'll
+    # put a fresh H1 in front.
+    header_match = re.match(r"^# [^\n]*\n+", stripped_body)
+    if header_match:
+        stripped_body = stripped_body[header_match.end():]
+
+    new_body = (
+        f"# Shot{suffix} — Brief\n\n"
+        + authoritative
+        + "\n"
+        + stripped_body.rstrip()
+        + "\n"
+    )
+    brief_path.write_text(new_body)
 
 
-def _find_adjacent_asset_collisions(
-    project_dir: Path, timing: dict
-) -> list[tuple[str, list[str]]]:
+async def run_phase_prompt_engineer(project_dir: Path, model: str) -> None:
     """
-    Walk shots in timing order and return adjacent collisions.
+    Phase PE — Translation Prompt Engineer.
 
-    For each pair (shot N, shot N+1) where shot N+1 imports any asset
-    that shot N also imports, emit (shot_id_N+1, sorted_list_of_collisions).
+    One Claude instance that reads the full project context (spec,
+    script, timing, design skill, rules catalog, scraped showcase) and
+    writes a lean, concrete, bold per-shot brief to
+    <project_dir>/shot_instructions/Shot{NN}.md for every shot.
+
+    After the PE finishes, Python re-splices the authoritative timing
+    block (from tools/get_shot_timing.py) into every brief, overwriting
+    any timing/phrase/anchor content the PE wrote. This makes the one
+    hard rule — frame integrity — literally impossible for the PE to
+    break, regardless of prompt discipline.
+
+    Downstream shot agents then receive their brief (authoritative
+    timing block + creative direction) appended to the standard
+    shot_prompt.md and just execute it.
     """
-    shots = timing.get("shots", [])
-    collisions: list[tuple[str, list[str]]] = []
-    prev_assets: set[str] = set()
-    for shot in shots:
-        sid = shot["id"]
-        my_assets = _extract_assets_from_shot_file(project_dir, sid)
-        overlap = my_assets & prev_assets
-        if overlap:
-            collisions.append((sid, sorted(overlap)))
-        prev_assets = my_assets
-    return collisions
+    print("\n" + "=" * 70)
+    print("  PHASE PE — Translation Prompt Engineer")
+    print("=" * 70 + "\n")
 
+    instr_dir = project_dir / "shot_instructions"
+    instr_dir.mkdir(parents=True, exist_ok=True)
 
-def _write_shot_assets_override(
-    project_dir: Path,
-    shot_id: str,
-    all_assets: list[dict],
-    exclusions: set[str],
-) -> Path:
-    """
-    Write the per-shot asset catalog override at <project_dir>/<shot_id>.assets.json.
+    client = _build_client(
+        project_dir=project_dir,
+        model=model,
+        system_prompt=(
+            "You are a translation prompt engineer and art director. "
+            "Read the project context. For every shot, first run "
+            "`python tools/get_shot_timing.py <shot_id>` via Bash and paste "
+            "its stdout verbatim at the top of the brief. Then write the "
+            "creative direction below. Write to shot_instructions/Shot{NN}.md."
+        ),
+        allowed_writes=["Write(shot_instructions/**)", "Edit(shot_instructions/**)"],
+    )
+    prompt = _load_prompt("prompt_engineer_prompt.md")
+    async with client:
+        status, _ = await run_agent_session(client, prompt, project_dir)
+    if status != "continue":
+        raise RuntimeError("Phase PE (prompt engineer) failed")
 
-    Contains the global assets.json catalog with any entries whose
-    `filename` is in `exclusions` removed. Shot agents are instructed
-    by shot_prompt.md to read this file IF it exists, instead of
-    assets.json.
-    """
-    filtered = [a for a in all_assets if a.get("filename") not in exclusions]
-    path = project_dir / f"{shot_id}.assets.json"
-    path.write_text(json.dumps(filtered, indent=2))
-    return path
-
-
-async def run_shot_redo(
-    project_dir: Path,
-    model: str,
-    shot_id: str,
-    semaphore: asyncio.Semaphore,
-) -> tuple[str, str]:
-    """
-    Re-run a shot agent. Identical to run_phase_b_shot, except the
-    semaphore is shared with whatever loop is calling it. The agent
-    uses the standard shot_prompt.md — exclusions are enforced by the
-    per-shot override file, not by prompt injection.
-    """
-    suffix = _shot_suffix(shot_id)
-    allowed_writes = [
-        f"Write(src/shots/Shot{suffix}.tsx)",
-        f"Edit(src/shots/Shot{suffix}.tsx)",
-        f"Write(src/shots/Shot{suffix}.anchors.json)",
-        f"Edit(src/shots/Shot{suffix}.anchors.json)",
-    ]
-    async with semaphore:
-        client = _build_client(
-            project_dir=project_dir,
-            model=model,
-            system_prompt=(
-                f"You are the shot agent for {shot_id}, re-running because a "
-                "previous version collided with a neighbor's asset choice. "
-                "Read your per-shot asset override file and pick a different "
-                "visual approach."
-            ),
-            allowed_writes=allowed_writes,
-        )
-        prompt = _load_prompt("shot_prompt.md") + f"\n\n## SHOT_ID\n\n{shot_id}\n"
-        async with client:
-            status, response = await run_agent_session(client, prompt, project_dir)
-        return status, response
-
-
-async def run_asset_diversity_pass(
-    project_dir: Path,
-    model: str,
-) -> None:
-    """
-    Reactive diversity check, loop-until-clean.
-
-    After Phase B passes alignment, scan adjacent shots for shared
-    asset usage. For each colliding shot, accumulate a persistent
-    exclusion set, write a per-shot override file with the colliding
-    assets physically removed from the catalog, and respawn the shot
-    agent. Re-stitch anchors + re-run alignment test. Loop.
-
-    Termination: each iteration adds at least one entry to one
-    shot's exclusion set. Maximum exclusion size per shot equals the
-    number of available assets. Once a shot's override file is empty,
-    the agent goes fully code-generated and cannot collide. Bound:
-    `len(shots) × len(assets)` iterations, typically 1–2.
-
-    A safety cap of `max(20, len(shots) × len(assets))` guards against
-    agents ignoring the override file.
-    """
+    # Validate every brief exists AND splice in the authoritative timing.
     timing = json.loads((project_dir / "timing.json").read_text())
-    assets_path = project_dir / "assets.json"
-    if not assets_path.exists():
-        print("[diversity] no assets.json — skipping diversity pass")
-        return
-
-    all_assets = json.loads(assets_path.read_text())
-    if len(all_assets) < 2:
-        print(f"[diversity] only {len(all_assets)} asset(s) — diversity pass not meaningful, skipping")
-        return
-
-    n_shots = len(timing.get("shots", []))
-    safety_bound = max(20, n_shots * len(all_assets))
-    exclusions: dict[str, set[str]] = {}
-    semaphore = asyncio.Semaphore(5)
-
-    iteration = 0
-    while True:
-        iteration += 1
-        if iteration > safety_bound:
-            print(
-                f"[diversity] safety bound ({safety_bound}) hit — stopping "
-                "(agent likely ignored override file)"
-            )
-            return
-
-        collisions = _find_adjacent_asset_collisions(project_dir, timing)
-        if not collisions:
-            if iteration == 1:
-                print("[diversity] iteration 1: no adjacent reuse — skipping")
-            else:
-                print(f"[diversity] iteration {iteration}: clean — exiting")
-            return
-
-        print(
-            f"[diversity] iteration {iteration}: found {len(collisions)} "
-            f"adjacent collision(s): {[(c[0], c[1]) for c in collisions]}"
+    expected = [s["id"] for s in timing.get("shots", [])]
+    missing: list[str] = []
+    for shot_id in expected:
+        suffix = _shot_suffix(shot_id)
+        brief_path = instr_dir / f"Shot{suffix}.md"
+        if not brief_path.exists() or brief_path.stat().st_size == 0:
+            missing.append(shot_id)
+            continue
+        _splice_authoritative_timing_into_brief(project_dir, shot_id)
+    if missing:
+        raise RuntimeError(
+            f"Phase PE did not produce briefs for: {missing}. "
+            f"Check prompt_engineer output above."
         )
-
-        # Accumulate exclusions and write override files for each colliding shot.
-        rerun_shots: list[str] = []
-        for shot_id, colliding in collisions:
-            exclusions.setdefault(shot_id, set()).update(colliding)
-            override_path = _write_shot_assets_override(
-                project_dir, shot_id, all_assets, exclusions[shot_id]
-            )
-            remaining = len(all_assets) - len(exclusions[shot_id])
-            print(
-                f"[diversity] writing {override_path.name} "
-                f"(excluded: {sorted(exclusions[shot_id])}, {remaining} remain)"
-            )
-            rerun_shots.append(shot_id)
-
-        # Reroll the colliding shots in parallel, semaphore-limited.
-        results = await asyncio.gather(
-            *(run_shot_redo(project_dir, model, sid, semaphore) for sid in rerun_shots),
-            return_exceptions=True,
-        )
-        for sid, res in zip(rerun_shots, results):
-            if isinstance(res, Exception):
-                print(f"[diversity] reroll {sid} raised: {res}")
-
-        # Re-stitch anchors and re-run alignment test.
-        n_anchors = stitch_anchors(project_dir)
-        print(f"[diversity] re-stitched {n_anchors} anchors after reroll")
-        result = run_alignment_test(project_dir)
-        print(f"[diversity] post-reroll alignment: {result.summary()}")
-        if not result.passed:
-            raise RuntimeError(
-                f"Diversity reroll broke the alignment test.\n"
-                f"Failures: {result.failures}\n{result.stderr[:500]}"
-            )
+    print(
+        f"[PE] wrote {len(expected)} per-shot briefs with authoritative "
+        f"timing blocks spliced in"
+    )
 
 
 async def run_phase_b_shot(
@@ -654,173 +642,48 @@ async def run_phase_b_shot(
     model: str,
     semaphore: asyncio.Semaphore,
 ) -> tuple[str, str]:
-    """One shot agent, scoped to its own files."""
+    """
+    One shot agent, scoped to its own files. Receives shot_prompt.md
+    plus its per-shot brief (written by Phase PE) appended at the bottom.
+    """
     suffix = _shot_suffix(shot_id)
     allowed_writes = [
         f"Write(src/shots/Shot{suffix}.tsx)",
         f"Edit(src/shots/Shot{suffix}.tsx)",
         f"Write(src/shots/Shot{suffix}.anchors.json)",
         f"Edit(src/shots/Shot{suffix}.anchors.json)",
+        # Shot agents need to write their fetched images into public/assets/
+        # via tools/fetch_image.py.
+        "Write(public/assets/**)",
+        "Edit(public/assets/**)",
     ]
+
+    # Load the custom brief the prompt engineer wrote for this shot.
+    brief_path = project_dir / "shot_instructions" / f"Shot{suffix}.md"
+    brief_text = brief_path.read_text() if brief_path.exists() else (
+        "(no brief found — improvise within the hard constraints above)"
+    )
 
     async with semaphore:
         client = _build_client(
             project_dir=project_dir,
             model=model,
             system_prompt=(
-                f"You are the shot agent for {shot_id}. "
-                "Write only your shot's component and anchors.json. "
-                "Never render captions — those are an overlay layer the "
-                "compositor mounts. Never touch other shots, Root.tsx, "
-                "Captions.tsx, or timing.json."
+                f"You are the shot agent for {shot_id}. Read your brief, "
+                "execute it. Frame integrity and anchor contract are "
+                "non-negotiable. Never touch other shots, Root.tsx, "
+                "anchors.ts, or timing.json."
             ),
             allowed_writes=allowed_writes,
         )
-        prompt = _load_prompt("shot_prompt.md") + f"\n\n## SHOT_ID\n\n{shot_id}\n"
+        prompt = (
+            _load_prompt("shot_prompt.md")
+            + f"\n\n## SHOT_ID\n\n{shot_id}\n"
+            + f"\n\n## SHOT_INSTRUCTIONS\n\n{brief_text}\n"
+        )
         async with client:
             status, response = await run_agent_session(client, prompt, project_dir)
         return status, response
-
-
-def _fetch_wikipedia_image(term: str, out_dir: Path) -> dict | None:
-    """
-    Fetch the main image for a Wikipedia-searchable term via the
-    MediaWiki action API. Returns an asset descriptor dict or None if
-    no image is available.
-
-    No API key required, no third-party dependencies — just urllib.
-    """
-    import urllib.parse
-    import urllib.request
-    import re
-
-    api_url = (
-        "https://en.wikipedia.org/w/api.php?"
-        "action=query&format=json&prop=pageimages&piprop=thumbnail%7Coriginal"
-        "&pithumbsize=1920&redirects=1&titles="
-        + urllib.parse.quote(term)
-    )
-    try:
-        req = urllib.request.Request(
-            api_url,
-            headers={"User-Agent": "video-director/1.0 (https://github.com/notaustindaniels/minimal)"},
-        )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception as e:
-        print(f"[assets]   API error for '{term}': {e}")
-        return None
-
-    pages = (data.get("query") or {}).get("pages") or {}
-    for page_id, page in pages.items():
-        if str(page_id) == "-1":
-            continue
-        thumb = page.get("thumbnail") or page.get("original")
-        if not thumb or not thumb.get("source"):
-            continue
-        img_url = thumb["source"]
-
-        safe_name = re.sub(r"[^a-z0-9]+", "_", term.lower()).strip("_")[:40] or "asset"
-        ext = Path(urllib.parse.urlparse(img_url).path).suffix.lower() or ".jpg"
-        if ext not in (".jpg", ".jpeg", ".png", ".webp"):
-            ext = ".jpg"
-        out_file = out_dir / f"{safe_name}{ext}"
-
-        try:
-            req2 = urllib.request.Request(
-                img_url,
-                headers={"User-Agent": "video-director/1.0"},
-            )
-            with urllib.request.urlopen(req2, timeout=30) as resp:
-                out_file.write_bytes(resp.read())
-        except Exception as e:
-            print(f"[assets]   download error for '{term}': {e}")
-            return None
-
-        return {
-            "filename": f"assets/{out_file.name}",
-            "wikipedia_title": page.get("title", term),
-            "search_term": term,
-            "dimensions": f"{thumb.get('width')}x{thumb.get('height')}",
-            "source_url": img_url,
-        }
-    return None
-
-
-async def run_phase_assets(project_dir: Path, model: str) -> None:
-    """
-    Asset scout agent picks Wikipedia-searchable terms; Python then
-    downloads the images from the Wikipedia API. Produces assets.json
-    at the project root.
-
-    Failures here are non-fatal — we write an empty assets.json and
-    let Phase B fall back to shape/typography layouts.
-    """
-    print("\n" + "=" * 70)
-    print("  PHASE ASSETS — Wikipedia image fetcher")
-    print("=" * 70 + "\n")
-
-    assets_path = project_dir / "assets.json"
-    terms_path = project_dir / "asset_search_terms.json"
-
-    client = _build_client(
-        project_dir=project_dir,
-        model=model,
-        system_prompt=(
-            "You are an asset scout. Read script.json and video_spec.xml, "
-            "then write asset_search_terms.json with 5-10 Wikipedia-searchable "
-            "terms. Nothing else."
-        ),
-        allowed_writes=[
-            "Write(asset_search_terms.json)",
-            "Edit(asset_search_terms.json)",
-        ],
-    )
-    prompt = _load_prompt("asset_fetcher_prompt.md")
-    try:
-        async with client:
-            status, _ = await run_agent_session(client, prompt, project_dir)
-    except Exception as e:
-        print(f"[assets] scout agent raised: {e} — skipping asset fetch")
-        assets_path.write_text("[]")
-        return
-
-    if status != "continue" or not terms_path.exists():
-        print("[assets] scout did not produce asset_search_terms.json — skipping")
-        assets_path.write_text("[]")
-        return
-
-    try:
-        terms = json.loads(terms_path.read_text())
-    except Exception as e:
-        print(f"[assets] asset_search_terms.json is malformed ({e}) — skipping")
-        assets_path.write_text("[]")
-        return
-
-    assets_dir = project_dir / "public" / "assets"
-    assets_dir.mkdir(parents=True, exist_ok=True)
-
-    downloaded: list[dict] = []
-    for item in terms:
-        if isinstance(item, dict):
-            term = item.get("term") or ""
-            reason = item.get("reason") or ""
-        else:
-            term = str(item)
-            reason = ""
-        if not term:
-            continue
-        print(f"[assets] fetching '{term}' from Wikipedia")
-        result = _fetch_wikipedia_image(term, assets_dir)
-        if result:
-            result["reason"] = reason
-            downloaded.append(result)
-            print(f"[assets]   got {result['filename']} ({result['dimensions']})")
-        else:
-            print(f"[assets]   no image found for '{term}'")
-
-    assets_path.write_text(json.dumps(downloaded, indent=2))
-    print(f"[assets] wrote {len(downloaded)}/{len(terms)} asset entries to assets.json")
 
 
 async def run_phase_b(
@@ -1045,7 +908,7 @@ async def run_phase_c(project_dir: Path, model: str, max_render_retries: int = 3
 def _preflight() -> None:
     missing = [
         var
-        for var in ("CLAUDE_CODE_OAUTH_TOKEN", "ELEVENLABS_API_KEY")
+        for var in ("CLAUDE_CODE_OAUTH_TOKEN", "ELEVENLABS_API_KEY", "PEXELS_API_KEY")
         if not os.environ.get(var)
     ]
     if missing:
@@ -1078,20 +941,20 @@ async def main_async(args: argparse.Namespace) -> None:
     # Phase A: director agent → script.json (continuous narration + phrases)
     await run_phase_a(project_dir, args.model)
 
-    # Phase Assets: scout agent + Wikipedia downloader → assets.json
-    await run_phase_assets(project_dir, args.model)
-
     # Driver: TTS → audio.mp3 + timing.json (anchors + shot frames)
     script = load_script(project_dir / "script.json")
     synthesize_script(script, project_dir, fps=args.fps)
 
-    # Phase B: parallel shot agents (with alignment retry loop)
-    await run_phase_b(project_dir, args.model, max_retries=args.max_scene_retries)
+    # Phase PE: translation prompt engineer reads everything and
+    # writes shot_instructions/Shot{NN}.md for each shot.
+    await run_phase_prompt_engineer(project_dir, args.model)
 
-    # Asset diversity pass: detect adjacent-shot photo reuse, reroll
-    # offending shots with the colliding asset(s) hidden via per-shot
-    # override files. Loops until clean.
-    await run_asset_diversity_pass(project_dir, args.model)
+    # Phase B: parallel shot agents. Each reads its custom brief
+    # appended to shot_prompt.md. On-demand Pexels fetches via
+    # tools/fetch_image.py. No central catalog → no adjacent-collision
+    # coordination needed (the PE prescribes different techniques
+    # per adjacent shot up-front).
+    await run_phase_b(project_dir, args.model, max_retries=args.max_scene_retries)
 
     # Phase C: compositor → render (with patch retry on render failure)
     await run_phase_c(project_dir, args.model)

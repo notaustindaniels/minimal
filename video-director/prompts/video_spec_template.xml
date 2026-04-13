@@ -21,8 +21,9 @@
       - ELEVENLABS_VOICE_ID optionally overrides the default voice
       - Node 20+ and pnpm are available
       - The Remotion project is pre-scaffolded by the harness driver
-      - public/assets/ contains Wikipedia-sourced reference images
-        (see assets.json)
+      - public/assets/ is empty at start. Shot agents fetch images
+        on-demand via `python tools/fetch_image.py` (Pexels primary,
+        Pixabay/Wikipedia fallbacks, U2-Net small saliency sidecar)
       - docs/remotion-rules/ contains the full remotion-best-practices
         skill (see docs/remotion-rules/INDEX.md)
       - docs/remotion-design-skill.md contains the "go bold" design
@@ -68,12 +69,12 @@
       <tasks>Read video_spec.xml, write script.json (narration + phrases + anchors), stop.</tasks>
     </step>
     <step number="2">
-      <title>Phase Assets</title>
-      <tasks>Asset scout picks Wikipedia-searchable terms; driver downloads images to public/assets/.</tasks>
-    </step>
-    <step number="3">
       <title>TTS</title>
       <tasks>Driver synthesizes narration via ElevenLabs, derives shot frame ranges from phrases.</tasks>
+    </step>
+    <step number="3">
+      <title>Phase PE — Translation Prompt Engineer</title>
+      <tasks>One agent reads everything and writes shot_instructions/Shot{NN}.md — a lean, bold, art-directed brief per shot. Shot agents receive these as their custom prompts.</tasks>
     </step>
     <step number="4">
       <title>Phase B — Shot components (parallel, max 5 concurrent)</title>
