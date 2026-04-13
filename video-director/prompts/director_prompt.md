@@ -26,6 +26,33 @@ in your head. When does the line want to breathe? When does it want to
 pivot? Mark phrase boundaries at the points where a video editor would
 cut.
 
+### Cut points to ALWAYS take
+
+These are not optional. If your narration contains any of these
+constructions, you must split at them — keeping them inside a larger
+phrase makes the cuts feel mushy and miss the music:
+
+1. **Em-dashes that introduce new content.** Anything after a `—` that
+   adds a new comparison, fact, or implication is its own phrase.
+   `"It races at twelve hundred beats per minute — that's twenty
+   heartbeats in the time it takes you to blink."` is TWO phrases:
+   `"It races at twelve hundred beats per minute"` (shot) and
+   `"that's twenty heartbeats in the time it takes you to blink."`
+   (shot). Don't keep them stitched.
+2. **"That's", "which means", "in other words", "imagine that".** These
+   words introduce a reframe of the previous beat. The reframe deserves
+   its own moment — start a new phrase at the connector.
+3. **Sentence-ending punctuation followed by a contrasting setup.** A
+   period followed by "But", "However", "And yet", "Now imagine"
+   should always be a phrase boundary. The sentence break IS the cut.
+4. **Single-word punchlines.** If the narration ends a build on one
+   word — `"hovering."`, `"impossible."`, `"dead."` — that word gets
+   its own phrase, regardless of how short.
+5. **Colons that introduce a noun.** `"...the most demanding flight
+   mode in nature: hovering."` splits at the colon. The lead-in is
+   one phrase (often a transition); the noun is the next phrase
+   (usually a shot).
+
 Concrete example for a hummingbird video. Given this narration:
 
 > A human heart beats about seventy times per minute. A hummingbird's
